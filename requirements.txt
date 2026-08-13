@@ -1,0 +1,11 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+yt-dlp>=2025.1.15
+faster-whisper>=1.1,<2
+srt>=3.5,<4
+requests>=2.32,<3
+python-dotenv>=1.0,<2
+pydantic>=2.9,<3
+edge-tts>=7.0,<8
+pydub>=0.25,<1
+librosa>=0.11,<2

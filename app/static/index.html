@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Hongguo Video Translator</title>
+  <style>
+    :root{font-family:system-ui,sans-serif;color:#172033;background:#f3f5f9}body{max-width:850px;margin:40px auto;padding:0 18px}
+    main{background:white;border-radius:14px;padding:28px;box-shadow:0 8px 30px #25304a18}h1{margin-top:0}label{display:block;margin:14px 0 5px}
+    input[type=url],select{width:100%;box-sizing:border-box;padding:11px;border:1px solid #ccd2dc;border-radius:7px}fieldset{border:0;padding:4px 0}
+    fieldset label{display:inline-block;margin-right:20px}button{background:#e43d52;color:white;border:0;border-radius:7px;padding:11px 20px;font-weight:700;cursor:pointer}
+    button:disabled{opacity:.55}.status{margin-top:24px;padding:15px;background:#f6f7fa;border-radius:8px;white-space:pre-wrap}.error{color:#b42318}.links a{display:block;margin:7px 0}
+  </style>
+</head>
+<body><main><h1>Hongguo Video Translator</h1>
+  <form id="form">
+    <label for="url">Hongguo / MP4 / M3U8 URL</label><input id="url" type="url" required placeholder="https://...">
+    <label for="provider">Nhà cung cấp dịch</label><select id="provider"><option>openai</option><option>gemini</option><option selected>deepseek</option></select>
+    <label for="model">WhisperX model</label><select id="model"><option>tiny</option><option>base</option><option>small</option><option>medium</option><option selected>large-v3</option></select>
+    <fieldset><label><input id="diarize" type="checkbox" checked> Tách lượt thoại</label></fieldset>
+    <label for="voice">Giọng local duy nhất</label><select id="voice"><option value="Ngọc Huyền — authorized clone" selected>Ngọc Huyền — voice đã được cấp quyền</option></select>
+    <label for="originalVolume">Âm thanh gốc nền</label><select id="originalVolume"><option value="0">Tắt hoàn toàn</option><option value="0.08">8%</option><option value="0.12" selected>12%</option><option value="0.2">20%</option></select>
+    <fieldset><label><input id="burn" type="checkbox" checked> Burn phụ đề Việt</label><label><input id="dub" type="checkbox"> Lồng tiếng cơ bản</label></fieldset>
+    <button id="start">Bắt đầu</button>
+  </form>
+  <div id="status" class="status" hidden></div><div id="links" class="links"></div>
+</main>
+<script>
+const form=document.querySelector('#form'),statusBox=document.querySelector('#status'),links=document.querySelector('#links'),button=document.querySelector('#start');let timer;
+const labels={video:'source.mp4',source_srt:'source.srt',translated_srt:'vi.srt',burned_video:'vi-burned.mp4',dubbed_video:'vi-dubbed.mp4',speaker_report:'báo cáo speaker/voice'};
+function render(job){statusBox.hidden=false;statusBox.className='status'+(job.status==='failed'?' error':'');statusBox.textContent=`Trạng thái: ${job.status}\nBước: ${job.step}\n${job.progress_message}${job.error?'\nLỗi: '+job.error:''}`;links.innerHTML='';if(job.status==='done')for(const [key,url] of Object.entries(job.outputs))if(url){const a=document.createElement('a');a.href=url;a.textContent='Tải '+(labels[key]||key);links.append(a)}if(['done','failed'].includes(job.status)){clearInterval(timer);button.disabled=false}}
+async function poll(id){try{const r=await fetch('/api/jobs/'+id);if(!r.ok)throw new Error(await r.text());render(await r.json())}catch(e){statusBox.textContent='Không thể cập nhật: '+e.message}}
+form.addEventListener('submit',async e=>{e.preventDefault();clearInterval(timer);links.innerHTML='';button.disabled=true;statusBox.hidden=false;statusBox.textContent='Đang tạo job...';try{const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:document.querySelector('#url').value,provider:document.querySelector('#provider').value,asr_model:document.querySelector('#model').value,diarize:document.querySelector('#diarize').checked,max_speakers:6,source_language_code:'zh',source_language:'Chinese',target_language:'Vietnamese',burn_subtitles:document.querySelector('#burn').checked,dub:document.querySelector('#dub').checked,narrator_mode:true,tts_voice:document.querySelector('#voice').value,original_audio_volume:Number(document.querySelector('#originalVolume').value)})});const body=await r.json();if(!r.ok)throw new Error(JSON.stringify(body));render(body);timer=setInterval(()=>poll(body.id),2000)}catch(e){statusBox.className='status error';statusBox.textContent='Lỗi: '+e.message;button.disabled=false}});
+</script></body></html>

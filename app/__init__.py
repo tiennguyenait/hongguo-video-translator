@@ -1,0 +1,1 @@
+"""Hongguo video translation server."""

@@ -1,0 +1,20 @@
+.env
+.venv/
+data/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local/generated voice assets must not enter source control.
+*.wav
+*.mp3
+
+# Runtime/log/editor artifacts.
+*.log
+.DS_Store
+.idea/
+.vscode/
