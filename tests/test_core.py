@@ -204,7 +204,20 @@ def test_adaptive_subtitle_fits_text_and_uses_same_mask_region(tmp_path):
     assert r"\p1" in content
     assert report[0]["region"]["width"] == 900
     assert report[0]["background"]["radius"] > 0
-    assert report[0]["background"]["width"] <= 900
+    assert report[0]["background"]["width"] >= 900
+
+
+def test_adaptive_mask_never_shrinks_below_source_bounds(tmp_path):
+    cue = srt.Subtitle(1, timedelta(seconds=1), timedelta(seconds=4), "Ngắn")
+    region = SubtitleRegion(250, 620, 780, 70, 0.98, 2, 3)
+    report = generate_adaptive_ass([cue], [region], 1280, 720, tmp_path / "vi.ass")
+    background = report[0]["background"]
+    assert background["x"] <= region.x
+    assert background["x"] + background["width"] >= region.x + region.width
+    assert background["y"] <= region.y
+    assert background["y"] + background["height"] >= region.y + region.height
+    assert report[0]["render_start"] == 2
+    assert report[0]["render_end"] == 3
 
 
 def test_adaptive_subtitle_normalizes_vietnamese_and_uses_static_font(tmp_path):

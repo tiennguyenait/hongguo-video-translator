@@ -54,14 +54,37 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
         mask = json.loads(regions_path.read_text(encoding="utf-8"))
         regions = mask.get("regions", [])
         confidence = min((item.get("confidence", 0) for item in regions), default=0)
-        severity = "pass" if confidence >= 0.5 else "warning"
-        add("source_subtitle_mask", severity, f"Detected {len(regions)} source subtitle intervals at confidence {confidence:.2f} ({mask.get('method')})")
+        dimensions = mask.get("video", {})
+        width, height = dimensions.get("width", 0), dimensions.get("height", 0)
+        invalid_regions = [index for index, item in enumerate(regions) if (
+            item.get("width", 0) <= 0 or item.get("height", 0) <= 0 or item.get("start", -1) < 0
+            or item.get("end", 0) <= item.get("start", 0) or item.get("x", -1) < 0 or item.get("y", -1) < 0
+            or item.get("x", 0) + item.get("width", 0) > width
+            or item.get("y", 0) + item.get("height", 0) > height
+        )]
+        if invalid_regions or not regions:
+            severity = "error"
+        elif confidence < 0.5 or mask.get("method") == "lower_band_fallback":
+            severity = "warning"
+        else:
+            severity = "pass"
+        detail = f"; invalid tracks {invalid_regions}" if invalid_regions else ""
+        add("source_subtitle_mask", severity, f"Detected {len(regions)} visual text tracks at confidence {confidence:.2f} ({mask.get('method')}){detail}")
 
     layout_path = job_dir / "subtitle-layout.json"
     if layout_path.is_file():
         layout = json.loads(layout_path.read_text(encoding="utf-8"))
         invalid = [item["id"] for item in layout if not item.get("font") or not (12 <= item.get("font_size", 0) <= 80) or len(item.get("lines", [])) not in {1, 2} or item.get("background", {}).get("radius", 0) <= 0]
         add("adaptive_subtitle_layout", "pass" if not invalid else "error", f"Adaptive font/layout valid for {len(layout)} cues" if not invalid else f"Invalid adaptive layout ids: {invalid}")
+        uncovered = []
+        for item in layout:
+            background, region = item.get("background", {}), item.get("region", {})
+            if (background.get("x", 0) > region.get("x", 0)
+                    or background.get("y", 0) > region.get("y", 0)
+                    or background.get("x", 0) + background.get("width", 0) < region.get("x", 0) + region.get("width", 0)
+                    or background.get("y", 0) + background.get("height", 0) < region.get("y", 0) + region.get("height", 0)):
+                uncovered.append(item["id"])
+        add("source_pixels_covered", "pass" if not uncovered else "error", "Every rendered mask contains its source-text bounds" if not uncovered else f"Mask can expose source pixels for ids: {uncovered}")
 
     if output_video and output_video.is_file():
         try:

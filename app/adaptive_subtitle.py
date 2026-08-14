@@ -106,15 +106,38 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     background_events: list[str] = []
     text_events: list[str] = []
     report: list[dict] = []
+    # Source coverage is independent from ASR/translation cues. Render every
+    # visually observed track for its exact lifetime so cue-boundary drift can
+    # never expose Chinese pixels.
+    for region in regions:
+        radius = max(8, round(region.height * 0.18))
+        path = _rounded_rectangle_path(region.x, region.y, region.width, region.height, radius)
+        background_events.append(
+            f"Dialogue: 0,{_ass_time(region.start)},{_ass_time(region.end)},Background,,0,0,0,,"
+            rf"{{\an7\pos(0,0)\p1\1c&H000000&\bord0\shad0}}{path}"
+        )
     previous_size: int | None = None
     for cue in subtitles:
         normalized_text = unicodedata.normalize("NFC", cue.content.strip())
-        midpoint = (cue.start.total_seconds() + cue.end.total_seconds()) / 2
-        matching = [region for region in regions if region.start <= midpoint <= region.end]
-        region = matching[0] if matching else min(regions, key=lambda item: min(abs(midpoint - item.start), abs(midpoint - item.end)))
-        available_width = round(region.width * 0.96)
+        cue_start, cue_end = cue.start.total_seconds(), cue.end.total_seconds()
+        midpoint = (cue_start + cue_end) / 2
+        def overlap(item: SubtitleRegion) -> float:
+            return max(0.0, min(cue_end, item.end) - max(cue_start, item.start))
+        region = max(regions, key=lambda item: (overlap(item), -min(abs(midpoint-item.start), abs(midpoint-item.end))))
+        overlapping_regions = [item for item in regions if overlap(item) > 0]
+        visual_overlap = sum(overlap(item) for item in overlapping_regions)
+        # Use visual boundaries when detector support is meaningful. A tiny
+        # single-frame overlap is treated as uncertain and retains speech timing.
+        if visual_overlap >= min(0.35, (cue_end-cue_start) * 0.30):
+            render_start = max(cue_start, min(item.start for item in overlapping_regions))
+            render_end = min(cue_end, max(item.end for item in overlapping_regions))
+        else:
+            render_start, render_end = cue_start, cue_end
+        max_font_size = round(video_height * 0.047)
+        natural_width = _text_width(normalized_text, _font(max_font_size)) + round(video_width * 0.028)
+        available_width = round(min(video_width * 0.88, max(region.width * 0.96, natural_width)))
         available_height = round(region.height * 0.82)
-        fitted = fit_text(normalized_text, available_width, available_height, max_font_size=round(video_height * 0.047))
+        fitted = fit_text(normalized_text, available_width, available_height, max_font_size=max_font_size)
         # Quantized sizes avoid distracting frame-to-frame pumping. Adjacent cues
         # may shrink for long lines but never jump upward by more than one level.
         if previous_size is not None and fitted.font_size > previous_size + 2:
@@ -125,23 +148,28 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         rendered_width = max(_text_width(line, font) for line in fitted.lines)
         padding_x = max(18, round(video_width * 0.014))
         padding_y = max(8, round(video_height * 0.010))
-        background_width = min(region.width, max(round(region.width * 0.38), round(rendered_width + padding_x * 2)))
+        # The source pixels decide the minimum mask size. A short Vietnamese line
+        # must never shrink the box and expose either end of a longer source line.
+        background_width = min(video_width, max(region.width, round(rendered_width + padding_x * 2)))
         line_height = fitted.font_size * 1.22
-        background_height = min(region.height, max(round(video_height * 0.073), round(line_height * len(fitted.lines) + padding_y * 2)))
-        background_x, background_y = x - background_width // 2, y - background_height // 2
+        background_height = min(video_height, max(region.height, round(line_height * len(fitted.lines) + padding_y * 2)))
+        background_x = max(0, min(video_width - background_width, x - background_width // 2))
+        background_y = max(0, min(video_height - background_height, y - background_height // 2))
         radius = max(8, round(background_height * 0.18))
         path = _rounded_rectangle_path(background_x, background_y, background_width, background_height, radius)
         background_events.append(
-            f"Dialogue: 0,{_ass_time(cue.start.total_seconds())},{_ass_time(cue.end.total_seconds())},Background,,0,0,0,,"
+            f"Dialogue: 0,{_ass_time(render_start)},{_ass_time(render_end)},Background,,0,0,0,,"
             rf"{{\an7\pos(0,0)\p1\1c&H000000&\bord0\shad0}}{path}"
         )
         text = r"\N".join(_escape_ass(line) for line in fitted.lines)
         override = rf"{{\an5\pos({x},{y})\fs{fitted.font_size}}}"
-        text_events.append(f"Dialogue: 1,{_ass_time(cue.start.total_seconds())},{_ass_time(cue.end.total_seconds())},Adaptive,,0,0,0,,{override}{text}")
+        text_events.append(f"Dialogue: 1,{_ass_time(render_start)},{_ass_time(render_end)},Adaptive,,0,0,0,,{override}{text}")
         report.append({
             "id": cue.index, "font": FONT_NAME, "font_size": fitted.font_size, "lines": fitted.lines, "x": x, "y": y,
             "background": {"x": background_x, "y": background_y, "width": background_width, "height": background_height, "radius": radius},
             "region": {"x": region.x, "y": region.y, "width": region.width, "height": region.height},
+            "render_start": round(render_start, 3), "render_end": round(render_end, 3),
+            "visual_overlap": round(visual_overlap, 3),
         })
     output.write_text(header + "\n".join(background_events + text_events) + "\n", encoding="utf-8")
     if report_path:

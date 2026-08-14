@@ -189,7 +189,7 @@ class JobWorker:
             burned = directory / "vi-burned.mp4"
             regions: list[SubtitleRegion] = []
             regions_path = directory / "subtitle-regions.json"
-            mask_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "source_cues": [(cue.index, str(cue.start), str(cue.end)) for cue in subtitles], "detector": "temporal-cv-v1"})
+            mask_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "detector": "visual-tracks-v2"})
             if job.get("hide_source_subtitles", 1):
                 if manifest.valid("source_subtitle_mask", mask_fingerprint, [regions_path]):
                     payload = json.loads(regions_path.read_text(encoding="utf-8"))
@@ -199,7 +199,7 @@ class JobWorker:
                     self._progress(job_id, JobStep.DETECTING_SUBTITLES, "Automatically locating burned-in source subtitles")
                     regions = detect_source_subtitle_regions(video, subtitles, regions_path)
                     manifest.complete("source_subtitle_mask", mask_fingerprint, [regions_path], {"regions": len(regions)})
-            burn_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "srt": translated_srt.read_text(encoding="utf-8"), "style": "adaptive-ass-v6-static-be-vietnam-pro", "mask": [region.to_dict() for region in regions]})
+            burn_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "srt": translated_srt.read_text(encoding="utf-8"), "style": "adaptive-ass-v9-track-envelope-timing", "mask": [region.to_dict() for region in regions]})
             expected_burn_files = [burned] + ([directory / "vi.ass", directory / "subtitle-layout.json"] if regions else [])
             if manifest.valid("burn", burn_fingerprint, expected_burn_files):
                 self._progress(job_id, JobStep.BURNING, "Resuming from burned subtitle video")
