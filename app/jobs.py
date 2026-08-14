@@ -211,8 +211,9 @@ class JobWorker:
             dub_video_base = directory / "vi-burned.mp4" if job["burn_subtitles"] else video
             dubbed = directory / "vi-dubbed.mp4"
             base_stat = dub_video_base.stat()
-            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "video_base": [base_stat.st_size, base_stat.st_mtime_ns], "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "sidechain-v3-48k", "prosody": "conservative-v1"})
-            if manifest.valid("dub", dub_fingerprint, [dubbed, directory / "speech-plan.json", directory / "prosody-plan.json", directory / "tts-timing.json"]):
+            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "source": [(cue.index, cue.content) for cue in subtitles], "video_base": [base_stat.st_size, base_stat.st_mtime_ns], "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "sidechain-v3-48k", "prosody": "conservative-v1", "semantic": "utterance-v1"})
+            dub_files = [dubbed, directory / "semantic-utterances.json", directory / "speech-plan.json", directory / "prosody-plan.json", directory / "tts-timing.json"]
+            if manifest.valid("dub", dub_fingerprint, dub_files):
                 self._progress(job_id, JobStep.DUBBING, "Resuming from cached Vietnamese dub")
             else:
                 self._progress(job_id, JobStep.DUBBING, "Creating Vietnamese natural dub")
@@ -223,8 +224,9 @@ class JobWorker:
                     json.loads(job.get("voice_overrides") or "{}"),
                     bool(job.get("narrator_mode", 1)),
                     job["provider"],
+                    subtitles,
                 )
-                manifest.complete("dub", dub_fingerprint, [dubbed, directory / "speech-plan.json", directory / "prosody-plan.json", directory / "tts-timing.json"])
+                manifest.complete("dub", dub_fingerprint, dub_files)
         self._progress(job_id, JobStep.QA, "Running automatic content, timing, and media QA")
         final_video = directory / "vi-dubbed.mp4" if job["dub"] else directory / "vi-burned.mp4" if job["burn_subtitles"] else video
         report = qa.validate_job(directory, translated, [cue.index for cue in subtitles], final_video)

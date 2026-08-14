@@ -49,6 +49,22 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
         add("tts_speed", "pass" if not rushed else "warning", "TTS speed is within natural limits" if not rushed else f"Review rushed utterances: {rushed[:20]}")
         add("tts_deadlines", "pass" if not overflow else "warning", "TTS clips fit their windows" if not overflow else f"Audio exceeds windows: {overflow[:20]}")
 
+    semantic_path = job_dir / "semantic-utterances.json"
+    if semantic_path.is_file():
+        semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+        items = semantic.get("items", [])
+        semantic_ids = [item_id for item in items for item_id in item.get("cue_ids", [])]
+        complete = semantic_ids == expected_ids
+        fragments = [
+            item.get("id") for item in items
+            if len(re.findall(r"\b[\wÀ-ỹ]+\b", item.get("text", ""), re.UNICODE)) <= 3
+            and (item.get("text", "").strip()[:1].islower() or not re.search(r"[.!?…]\s*$", item.get("text", "").strip()))
+        ]
+        add("semantic_cue_coverage", "pass" if complete else "error", "Every display cue belongs to exactly one semantic utterance" if complete else "Semantic utterances lost, duplicated, or reordered cue ids")
+        add("semantic_fragments", "pass" if not fragments else "warning", "TTS utterances are complete meaningful phrases" if not fragments else f"Review short TTS fragments: {fragments}")
+        semantic_warning = semantic.get("warning")
+        add("semantic_reflow", "pass" if not semantic_warning else "warning", "AI semantic reflow validated" if not semantic_warning else semantic_warning)
+
     regions_path = job_dir / "subtitle-regions.json"
     if regions_path.is_file():
         mask = json.loads(regions_path.read_text(encoding="utf-8"))
