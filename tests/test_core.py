@@ -15,6 +15,8 @@ from app.dialogue import build_dialogue_units, repair_fragment_speakers
 from app.speech_plan import build_speech_plans, predict_duration_ms
 from app.text_normalizer import normalize_spoken_text, vietnamese_integer
 from app.source_subtitle_mask import _candidate_boxes
+from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
+from app.source_subtitle_mask import SubtitleRegion
 
 
 def test_srt_timestamp_conversion():
@@ -163,6 +165,20 @@ def test_source_subtitle_detector_finds_centered_bright_text_but_not_plain_scene
     assert boxes
     assert boxes[0][1] > 580
     assert not _candidate_boxes(np.full((720, 1280, 3), 40, dtype=np.uint8))
+
+
+def test_adaptive_subtitle_fits_text_and_uses_same_mask_region(tmp_path):
+    short = fit_text("Anh về rồi.", 800, 64, 38)
+    long = fit_text("Đây là một câu thoại dài cần tự động thu nhỏ cho vừa vùng che phụ đề.", 500, 64, 38)
+    assert short.font_size >= long.font_size
+    assert 1 <= len(long.lines) <= 2
+    cue = srt.Subtitle(1, timedelta(seconds=1), timedelta(seconds=3), "Xin chào Việt Nam")
+    region = SubtitleRegion(100, 600, 900, 80, 0.9, 0, 4)
+    report = generate_adaptive_ass([cue], [region], 1280, 720, tmp_path / "vi.ass", tmp_path / "layout.json")
+    content = (tmp_path / "vi.ass").read_text()
+    assert f"Style: Adaptive,{FONT_NAME}" in content
+    assert r"\pos(550,640)" in content
+    assert report[0]["region"]["width"] == 900
 
 
 def test_word_grouping_does_not_split_on_noisy_character_speakers():

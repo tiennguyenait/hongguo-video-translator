@@ -147,8 +147,10 @@ def detect_source_subtitle_regions(video: Path, cues: list[srt.Subtitle], output
         y1, y2 = round(height * 0.76), round(height * 0.88)
         confidence, method = 0.25, "lower_band_fallback"
 
-    active_cues = [cue for cue in cues if cue.index in active_cue_ids] if active_cue_ids else cues
-    regions = [SubtitleRegion(x1, y1, x2 - x1, y2 - y1, round(confidence, 3), start, end) for start, end in _merge_intervals(active_cues, duration)]
+    # The detected band is also the presentation surface for Vietnamese text.
+    # Keep it active for every translated speech cue, not only frames where the
+    # source glyph detector fired, so no second background box is necessary.
+    regions = [SubtitleRegion(x1, y1, x2 - x1, y2 - y1, round(confidence, 3), start, end) for start, end in _merge_intervals(cues, duration)]
     output_json.write_text(json.dumps({
         "method": method, "video": {"width": width, "height": height},
         "samples": len(sample_points), "detections": len(observations), "active_cues": sorted(active_cue_ids),

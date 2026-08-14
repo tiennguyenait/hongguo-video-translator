@@ -43,6 +43,7 @@ class JobOutputs(BaseModel):
     speaker_report: str | None = None
     qa_report: str | None = None
     subtitle_regions: str | None = None
+    subtitle_layout: str | None = None
 
 
 class JobResponse(BaseModel):

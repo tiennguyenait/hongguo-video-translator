@@ -26,6 +26,7 @@ OUTPUT_NAMES = {
     "speaker_report": "voice-profiles.json",
     "qa_report": "qa-report.json",
     "subtitle_regions": "subtitle-regions.json",
+    "subtitle_layout": "subtitle-layout.json",
 }
 
 
@@ -198,13 +199,14 @@ class JobWorker:
                     self._progress(job_id, JobStep.DETECTING_SUBTITLES, "Automatically locating burned-in source subtitles")
                     regions = detect_source_subtitle_regions(video, subtitles, regions_path)
                     manifest.complete("source_subtitle_mask", mask_fingerprint, [regions_path], {"regions": len(regions)})
-            burn_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "srt": translated_srt.read_text(encoding="utf-8"), "style": "boxed-v4-opaque-source-mask", "mask": [region.to_dict() for region in regions]})
-            if manifest.valid("burn", burn_fingerprint, [burned]):
+            burn_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "srt": translated_srt.read_text(encoding="utf-8"), "style": "adaptive-ass-v2-ubuntu-sans", "mask": [region.to_dict() for region in regions]})
+            expected_burn_files = [burned] + ([directory / "vi.ass", directory / "subtitle-layout.json"] if regions else [])
+            if manifest.valid("burn", burn_fingerprint, expected_burn_files):
                 self._progress(job_id, JobStep.BURNING, "Resuming from burned subtitle video")
             else:
                 self._progress(job_id, JobStep.BURNING, "Burning Vietnamese subtitles into video")
                 media.burn_subtitles(video, translated_srt, burned, regions)
-                manifest.complete("burn", burn_fingerprint, [burned])
+                manifest.complete("burn", burn_fingerprint, expected_burn_files)
         if job["dub"]:
             dub_video_base = directory / "vi-burned.mp4" if job["burn_subtitles"] else video
             dubbed = directory / "vi-dubbed.mp4"
@@ -254,7 +256,7 @@ def apply_subtitle_review(job_id: str, edits: dict[int, str]) -> None:
     if translation:
         manifest.complete("translation", translation["fingerprint"], [translated_path, directory / "vi-final.json"], {"cues": len(subtitles), "human_reviewed": True})
         manifest.invalidate_after(["download", "transcript", "source_subtitle_mask", "translation", "burn", "dub", "qa"], "translation")
-    for filename in ("vi-burned.mp4", "vi-dubbed.mp4", "qa-report.json"):
+    for filename in ("vi-burned.mp4", "vi-dubbed.mp4", "vi.ass", "subtitle-layout.json", "qa-report.json"):
         (directory / filename).unlink(missing_ok=True)
 
 

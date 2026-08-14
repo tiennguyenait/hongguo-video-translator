@@ -2,6 +2,10 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import srt
+
+from .adaptive_subtitle import generate_adaptive_ass
+
 if TYPE_CHECKING:
     from .source_subtitle_mask import SubtitleRegion
 
@@ -23,14 +27,26 @@ def probe_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
-def _subtitle_filter(path: Path) -> str:
+def probe_video_size(path: Path) -> tuple[int, int]:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
+        text=True, capture_output=True,
+    )
+    if result.returncode or "x" not in result.stdout:
+        raise RuntimeError(f"ffprobe video size failed: {result.stderr.strip()}")
+    width, height = result.stdout.strip().split("x", 1)
+    return int(width), int(height)
+
+
+def _subtitle_filter(path: Path, force_style: bool = True) -> str:
     escaped = str(path.resolve()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''").replace(",", "\\,")
     style = (
         "FontName=Arial,FontSize=11,PrimaryColour=&H00FFFFFF,"
         "BackColour=&H70000000,OutlineColour=&H00000000,"
         "BorderStyle=3,Outline=1,Shadow=0,Alignment=2,MarginV=28"
     )
-    return f"subtitles=filename='{escaped}':force_style='{style}'"
+    suffix = f":force_style='{style}'" if force_style else ""
+    return f"subtitles=filename='{escaped}'{suffix}"
 
 
 def burn_subtitles(video: Path, subtitle: Path, output: Path, regions: list["SubtitleRegion"] | None = None) -> None:
@@ -41,7 +57,16 @@ def burn_subtitles(video: Path, subtitle: Path, output: Path, regions: list["Sub
             f"drawbox=x={region.x}:y={region.y}:w={region.width}:h={region.height}:"
             f"color=black@1.0:t=fill:enable='{enable}'"
         )
-    filters.append(_subtitle_filter(subtitle))
+    if regions:
+        width, height = probe_video_size(video)
+        ass_path = output.parent / "vi.ass"
+        generate_adaptive_ass(
+            list(srt.parse(subtitle.read_text(encoding="utf-8-sig"))), regions, width, height,
+            ass_path, output.parent / "subtitle-layout.json",
+        )
+        filters.append(_subtitle_filter(ass_path, force_style=False))
+    else:
+        filters.append(_subtitle_filter(subtitle))
     run_ffmpeg(["ffmpeg", "-y", "-i", str(video), "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "copy", "-movflags", "+faststart", str(output)])
 
 

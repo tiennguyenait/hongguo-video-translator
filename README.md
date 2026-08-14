@@ -68,6 +68,8 @@ Mỗi job nằm trong `data/jobs/{uuid}/`: `source.mp4`, `source.srt`, `vi-draft
 
 `hide_source_subtitles=true` (mặc định) lấy mẫu frame theo timestamp ASR, phát hiện vùng chữ bằng OpenCV, dùng temporal consensus để chọn một vùng ổn định và phủ tối đúng các khoảng có thoại trước khi burn chữ Việt. Kết quả được cache trong `subtitle-regions.json`; confidence thấp được ghi warning trong QA.
 
+Khi có vùng che, server sinh `vi.ass` thay vì đặt thêm nền riêng cho SRT. Chữ Việt dùng Ubuntu Sans SemiBold (fallback DejaVu Sans), được căn giữa trong chính vùng che và tự chọn cỡ chữ/chia tối đa hai dòng theo metric font thật. Cỡ chữ chỉ thay đổi theo bước 2 px để tránh hiệu ứng phóng–thu khó chịu; quyết định layout lưu trong `subtitle-layout.json`.
+
 Chế độ thuyết minh dùng một giọng VieNeu-TTS v3 Turbo local với style kể chuyện. Các cue cùng lượt nói được ghép thành câu tự nhiên và đặt lại đúng timeline. `subtitle_text` được giữ nguyên để hiển thị, còn `spoken_text` chuẩn hóa số/đơn vị cho TTS. `original_audio_volume=0` thay audio gốc; giá trị `0..1` giữ nhạc/hiệu ứng và tự động duck audio gốc khi giọng Việt xuất hiện.
 
 UI cho phép sửa từng câu sau khi job hoàn tất. Khi lưu, server giữ nguyên download/ASR/translation checkpoint, chỉ tạo lại subtitle burn, những clip TTS bị thay đổi, mix và QA.
