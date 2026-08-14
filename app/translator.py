@@ -162,8 +162,11 @@ def translate_subtitles(
                 if missing_ids:
                     missing_items = [item for item in items if item["id"] in missing_ids]
                     repair_prompt = (
-                        "The previous response omitted these subtitle items. Translate only this JSON array "
-                        "and return every listed id exactly once:\n"
+                        "The previous response omitted these non-empty dialogue items. Translate only this JSON array. "
+                        "Even if ASR seems imperfect, provide the best contextual Vietnamese interpretation; NEVER omit "
+                        "an item and NEVER return an empty array. Return every listed id exactly once in this exact shape: "
+                        '{"translations":[{"id":25,"text":"Vietnamese dialogue"}]}. '
+                        f"The required ids are {missing_ids}:\n"
                         + json.dumps(missing_items, ensure_ascii=False)
                     )
                     repair_raw = (
