@@ -221,7 +221,14 @@ class JobWorker:
         translation_fingerprint = stable_hash({"source": [(cue.index, cue.content) for cue in subtitles], "provider": job["provider"], "target": job["target_language"], "glossary": job["glossary"], "pipeline": "context-v2"})
         if manifest.valid("translation", translation_fingerprint, [translated_srt, directory / "vi-final.json"]):
             self._progress(job_id, JobStep.TRANSLATING, "Resuming from context-edited Vietnamese translation")
-            translated = read_srt(translated_srt)
+            resumed_mapping = {
+                int(item["id"]): str(item["text"])
+                for item in json.loads((directory / "vi-final.json").read_text(encoding="utf-8"))
+            }
+            translated = [
+                srt.Subtitle(cue.index, cue.start, cue.end, resumed_mapping.get(cue.index, ""))
+                for cue in subtitles
+            ]
         else:
             translated = translator.translate_subtitles(
                 subtitles, job["provider"], job["source_language"], job["target_language"], job["glossary"],
@@ -259,8 +266,15 @@ class JobWorker:
             "speakers": speakers, "provider": job["provider"], "boxes": box_widths, "pipeline": "display-lines-v3",
         })
         if manifest.valid("dialogue_master", master_fingerprint, [translated_srt, master_path]):
-            translated = read_srt(translated_srt)
             master_payload = json.loads(master_path.read_text(encoding="utf-8"))
+            display_mapping = {
+                int(item["id"]): str(item.get("text", ""))
+                for item in master_payload.get("display_lines", [])
+            }
+            translated = [
+                srt.Subtitle(cue.index, cue.start, cue.end, display_mapping.get(cue.index, ""))
+                for cue in subtitles
+            ]
             self._progress(job_id, JobStep.TRANSLATING, "Resuming validated dialogue master")
         else:
             self._progress(job_id, JobStep.TRANSLATING, "Reflowing complete dialogue into original display lines")
