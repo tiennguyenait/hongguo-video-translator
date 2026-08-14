@@ -60,7 +60,7 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
     layout_path = job_dir / "subtitle-layout.json"
     if layout_path.is_file():
         layout = json.loads(layout_path.read_text(encoding="utf-8"))
-        invalid = [item["id"] for item in layout if not (12 <= item.get("font_size", 0) <= 80) or len(item.get("lines", [])) not in {1, 2}]
+        invalid = [item["id"] for item in layout if not (12 <= item.get("font_size", 0) <= 80) or len(item.get("lines", [])) not in {1, 2} or item.get("background", {}).get("radius", 0) <= 0]
         add("adaptive_subtitle_layout", "pass" if not invalid else "error", f"Adaptive font/layout valid for {len(layout)} cues" if not invalid else f"Invalid adaptive layout ids: {invalid}")
 
     if output_video and output_video.is_file():

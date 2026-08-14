@@ -51,12 +51,6 @@ def _subtitle_filter(path: Path, force_style: bool = True) -> str:
 
 def burn_subtitles(video: Path, subtitle: Path, output: Path, regions: list["SubtitleRegion"] | None = None) -> None:
     filters: list[str] = []
-    for region in regions or []:
-        enable = f"between(t\\,{region.start:.3f}\\,{region.end:.3f})"
-        filters.append(
-            f"drawbox=x={region.x}:y={region.y}:w={region.width}:h={region.height}:"
-            f"color=black@1.0:t=fill:enable='{enable}'"
-        )
     if regions:
         width, height = probe_video_size(video)
         ass_path = output.parent / "vi.ass"

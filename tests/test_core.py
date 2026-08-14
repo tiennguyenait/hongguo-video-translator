@@ -178,7 +178,10 @@ def test_adaptive_subtitle_fits_text_and_uses_same_mask_region(tmp_path):
     content = (tmp_path / "vi.ass").read_text()
     assert f"Style: Adaptive,{FONT_NAME}" in content
     assert r"\pos(550,640)" in content
+    assert r"\p1" in content
     assert report[0]["region"]["width"] == 900
+    assert report[0]["background"]["radius"] > 0
+    assert report[0]["background"]["width"] <= 900
 
 
 def test_word_grouping_does_not_split_on_noisy_character_speakers():
