@@ -24,7 +24,7 @@ from app.source_subtitle_mask import SubtitleRegion
 from app.dialogue_master import build_dialogue_master
 from app.translator import translate_subtitles
 from app.media import AUDIO_BITRATE, VIDEO_CRF, apply_channel_watermark, concat_videos, probe_duration, probe_video_size
-from app.batching import natural_filename_key
+from app.batching import finalize_batch_for_job, natural_filename_key
 
 
 def test_srt_timestamp_conversion():
@@ -61,6 +61,22 @@ def test_single_upload_ui_uses_branded_batch_pipeline():
 def test_folder_episode_names_use_natural_numeric_order():
     names = ["tap-10.mp4", "tap-2.mp4", "tap-3.mp4", "tap-1.mp4"]
     assert sorted(names, key=natural_filename_key) == ["tap-1.mp4", "tap-2.mp4", "tap-3.mp4", "tap-10.mp4"]
+
+
+def test_batch_keeps_running_after_one_episode_fails(monkeypatch):
+    updates = []
+    monkeypatch.setattr("app.batching.get_job_batch", lambda _: "batch-1")
+    monkeypatch.setattr("app.batching.get_batch", lambda _: {"id": "batch-1", "status": "running"})
+    monkeypatch.setattr("app.batching.get_batch_jobs", lambda _: [
+        {"position": 1, "filename": "tap-1.mp4", "status": "failed", "error": "provider error"},
+        {"position": 2, "filename": "tap-2.mp4", "status": "running", "error": None},
+        {"position": 3, "filename": "tap-3.mp4", "status": "queued", "error": None},
+    ])
+    monkeypatch.setattr("app.batching.update_batch", lambda batch_id, **values: updates.append((batch_id, values)))
+    finalize_batch_for_job("job-1")
+    assert updates[-1][1]["status"] == "running"
+    assert "continuing" in updates[-1][1]["progress_message"]
+    assert "tap-1.mp4" in updates[-1][1]["error"]
 
 
 def test_concat_videos_normalizes_different_episode_sizes(tmp_path):

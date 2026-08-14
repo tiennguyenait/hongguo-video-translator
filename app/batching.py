@@ -95,6 +95,22 @@ def finalize_batch_for_job(job_id: str) -> None:
     if batch["status"] == "uploading":
         return
     failed = [item for item in episodes if item["status"] in {"failed", "needs_review"}]
+    active = [item for item in episodes if item["status"] in {"queued", "running"}]
+    completed = sum(item["status"] == "done" for item in episodes)
+    if active:
+        detail = None
+        if failed:
+            first = failed[0]
+            detail = f"{first['filename']}: {first.get('error') or first['status']}"
+        update_batch(
+            batch_id, status="running",
+            progress_message=(
+                f"Completed {completed}/{len(episodes)}; {len(failed)} need attention; "
+                f"continuing episode processing"
+            ),
+            error=detail,
+        )
+        return
     if failed:
         first = failed[0]
         update_batch(
@@ -103,7 +119,6 @@ def finalize_batch_for_job(job_id: str) -> None:
             error=f"{first['filename']}: {first.get('error') or first['status']}",
         )
         return
-    completed = sum(item["status"] == "done" for item in episodes)
     if completed < len(episodes):
         update_batch(
             batch_id, status="running",
