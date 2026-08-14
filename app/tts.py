@@ -14,6 +14,7 @@ from .config import get_settings
 from .voice_profiles import classify_speaker_voices
 from .artifacts import atomic_write_json, stable_hash
 from .speech_plan import build_speech_plans
+from .prosody import PROSODY_VERSION, plan_prosody
 
 
 def _fit_audio_to_window(audio: AudioSegment, target_ms: int, work_path: Path) -> AudioSegment:
@@ -114,7 +115,8 @@ def _synthesize_local_batch(items: list[dict], voice: str, clips_dir: Path) -> N
     cache_keys: dict[int, str] = {}
     missing: list[dict] = []
     for item in items:
-        key = stable_hash({"text": item["text"], "voice": voice, "reference": reference_stamp, "engine": "vieneu-v3-turbo"})
+        key = stable_hash({"text": item["text"], "style": item.get("style", "doc_truyen"), "voice": voice,
+                           "reference": reference_stamp, "engine": "vieneu-v3-turbo", "prosody": PROSODY_VERSION})
         cache_keys[item["id"]] = key
         cached = settings.tts_cache_dir / f"{key}.wav"
         output = clips_dir / f"{item['id']:06d}.wav"
@@ -150,6 +152,7 @@ def create_dub(
     secondary_voice: str = "vi-VN-NamMinhNeural",
     voice_overrides: dict[str, str] | None = None,
     narrator_mode: bool = True,
+    provider: str = "deepseek",
 ) -> Path:
     clips_dir = job_dir / "tts"
     clips_dir.mkdir(exist_ok=True)
@@ -170,9 +173,16 @@ def create_dub(
         profiles = classify_speaker_voices(video, subtitles, speakers, voice, secondary_voice, voice_overrides)
     utterances = build_utterances(subtitles, speakers)
     plans = build_speech_plans(utterances, video_duration_ms)
+    prosody_warning = None
+    if narrator_mode:
+        plans, prosody_warning = plan_prosody(plans, provider)
+    atomic_write_json(job_dir / "prosody-plan.json", {
+        "version": PROSODY_VERSION, "warning": prosody_warning,
+        "items": [plan.to_dict() for plan in plans],
+    })
     atomic_write_json(job_dir / "speech-plan.json", [plan.to_dict() for plan in plans])
     if narrator_mode:
-        _synthesize_local_batch([{"id": plan.id, "text": plan.spoken_text} for plan in plans], voice, clips_dir)
+        _synthesize_local_batch([{"id": plan.id, "text": plan.spoken_text, "style": plan.style} for plan in plans], voice, clips_dir)
     fitted_dir = clips_dir / "fitted"
     fitted_dir.mkdir(exist_ok=True)
     delayed_clips: list[tuple[Path, int]] = []
@@ -189,11 +199,13 @@ def create_dub(
         audio = _fit_audio_to_window(audio, target_window, clip_path)
         fitted_path = fitted_dir / f"{cue.index:06d}.wav"
         audio.set_frame_rate(48000).set_channels(1).set_sample_width(2).export(fitted_path, format="wav")
-        delayed_clips.append((fitted_path, plan.start_ms))
+        delayed_clips.append((fitted_path, plan.start_ms + plan.pause_before_ms))
         timing_report.append({
             "id": plan.id, "predicted_ms": plan.predicted_duration_ms, "original_ms": original_ms,
             "fitted_ms": len(audio), "target_ms": plan.target_duration_ms, "hard_deadline_ms": plan.hard_deadline_ms,
             "tempo": round(original_ms / max(1, len(audio)), 4), "overflow_ms": max(0, len(audio) - plan.hard_deadline_ms),
+            "emotion": plan.emotion, "intensity": plan.intensity, "style": plan.style,
+            "pause_before_ms": plan.pause_before_ms, "pause_after_ms": plan.pause_after_ms,
         })
         if progress and (number == len(utterances) or number % 5 == 0):
             progress(f"Synthesized {number}/{len(utterances)} natural utterances")

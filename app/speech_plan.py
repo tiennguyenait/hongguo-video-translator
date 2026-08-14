@@ -21,6 +21,11 @@ class SpeechPlan:
     predicted_duration_ms: int
     emotion: str
     pace: float
+    intensity: float = 0.45
+    style: str = "doc_truyen"
+    pause_before_ms: int = 0
+    pause_after_ms: int = 100
+    prosody_source: str = "fallback"
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -13,6 +13,7 @@ from app.tts import _fit_audio_to_window, build_utterances
 from app.artifacts import ArtifactManifest, stable_hash
 from app.dialogue import build_dialogue_units, repair_fragment_speakers
 from app.speech_plan import build_speech_plans, predict_duration_ms
+from app.prosody import apply_ai_prosody, plan_prosody
 from app.text_normalizer import normalize_spoken_text, vietnamese_integer
 from app.source_subtitle_mask import _candidate_boxes
 from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
@@ -123,6 +124,28 @@ def test_speech_plan_keeps_display_text_separate_from_spoken_text():
     assert plans[0].spoken_text == "Phòng rộng mười mét vuông."
     assert plans[0].hard_deadline_ms == 3000
     assert predict_duration_ms("Xin chào!") > 0
+
+
+def test_ai_prosody_accepts_punctuation_but_never_changed_words():
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "Anh yêu em")
+    plans = build_speech_plans([(cue, "A")], 2500)
+    raw = '[{"id":1,"spoken_text":"Anh... yêu em!","emotion":"warm","intensity":0.6,"style":"doc_truyen","pause_before_ms":40,"pause_after_ms":180}]'
+    apply_ai_prosody(plans, raw)
+    assert plans[0].spoken_text == "Anh... yêu em!"
+    assert plans[0].prosody_source == "ai"
+    changed = raw.replace("Anh... yêu em!", "Anh rất yêu em!")
+    fallback = build_speech_plans([(cue, "A")], 2500)
+    apply_ai_prosody(fallback, changed)
+    assert fallback[0].spoken_text == "Anh yêu em"
+    assert fallback[0].prosody_source == "fallback"
+
+
+def test_prosody_provider_failure_is_non_fatal():
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "Đừng đi!")
+    plans = build_speech_plans([(cue, "A")], 2500)
+    result, warning = plan_prosody(plans, "deepseek", lambda *_: (_ for _ in ()).throw(RuntimeError("offline")))
+    assert result[0].prosody_source == "fallback"
+    assert "offline" in warning
 
 
 def test_artifact_manifest_requires_matching_fingerprint_and_files(tmp_path):
