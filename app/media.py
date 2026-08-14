@@ -9,6 +9,9 @@ from .adaptive_subtitle import FONT_PATH, generate_adaptive_ass
 if TYPE_CHECKING:
     from .source_subtitle_mask import SubtitleRegion
 
+VIDEO_CRF = "23"
+AUDIO_BITRATE = "128k"
+
 
 def run_ffmpeg(command: list[str]) -> None:
     result = subprocess.run(command, text=True, capture_output=True)
@@ -64,7 +67,7 @@ def burn_subtitles(video: Path, subtitle: Path, output: Path, regions: list["Sub
         filters.append(_subtitle_filter(ass_path, force_style=False, fonts_dir=FONT_PATH.parent))
     else:
         filters.append(_subtitle_filter(subtitle))
-    run_ffmpeg(["ffmpeg", "-y", "-i", str(video), "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "copy", "-movflags", "+faststart", str(output)])
+    run_ffmpeg(["ffmpeg", "-y", "-i", str(video), "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "medium", "-crf", VIDEO_CRF, "-c:a", "copy", "-movflags", "+faststart", str(output)])
 
 
 def mux_dub(video: Path, wav: Path, output: Path, original_audio_volume: float) -> None:
@@ -73,7 +76,7 @@ def mux_dub(video: Path, wav: Path, output: Path, original_audio_volume: float) 
         command = ["ffmpeg", "-y", "-i", str(video), "-i", str(wav), "-filter_complex", filters, "-map", "0:v:0", "-map", "[a]"]
     else:
         command = ["ffmpeg", "-y", "-i", str(video), "-i", str(wav), "-map", "0:v:0", "-map", "1:a:0"]
-    command += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(output)]
+    command += ["-c:v", "copy", "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-shortest", "-movflags", "+faststart", str(output)]
     run_ffmpeg(command)
 
 
@@ -126,7 +129,7 @@ def mux_delayed_clips(
     script.write_text(";\n".join(filters), encoding="utf-8")
     command += [
         "-filter_complex_script", str(script), "-map", "0:v:0", "-map", f"[{output_label}]",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", f"{duration:.6f}",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-t", f"{duration:.6f}",
         "-movflags", "+faststart", str(output),
     ]
     run_ffmpeg(command)

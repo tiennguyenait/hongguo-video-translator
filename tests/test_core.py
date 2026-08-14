@@ -22,6 +22,7 @@ from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
 from app.source_subtitle_mask import SubtitleRegion
 from app.dialogue_master import build_dialogue_master
 from app.translator import translate_subtitles
+from app.media import AUDIO_BITRATE, VIDEO_CRF
 
 
 def test_srt_timestamp_conversion():
@@ -29,6 +30,11 @@ def test_srt_timestamp_conversion():
     assert cues[0].start == timedelta(milliseconds=1234)
     assert cues[0].end == timedelta(milliseconds=3457)
     assert cues[0].content == "hello"
+
+
+def test_delivery_encoding_balances_size_and_compatibility():
+    assert VIDEO_CRF == "23"
+    assert AUDIO_BITRATE == "128k"
 
 
 def test_translation_json_parsing_and_validation():
