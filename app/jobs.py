@@ -57,7 +57,7 @@ def serialize_job(row: dict[str, Any]) -> dict[str, Any]:
         "progress_message": row["progress_message"], "error": row["error"],
         "provider": row["provider"], "asr_model": row["asr_model"],
         "diarize": bool(row.get("diarize", 0)),
-        "burn_subtitles": bool(row["burn_subtitles"]), "hide_source_subtitles": bool(row.get("hide_source_subtitles", 1)), "dub": bool(row["dub"]),
+        "burn_subtitles": bool(row["burn_subtitles"]), "hide_source_subtitles": bool(row.get("hide_source_subtitles", 0)), "dub": bool(row["dub"]),
         "created_at": row["created_at"], "updated_at": row["updated_at"], "outputs": outputs,
     }
 
@@ -238,7 +238,7 @@ class JobWorker:
         regions: list[SubtitleRegion] = []
         regions_path = directory / "subtitle-regions.json"
         mask_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "detector": "visual-tracks-v2"})
-        if job["burn_subtitles"] and job.get("hide_source_subtitles", 1):
+        if job["burn_subtitles"] and job.get("hide_source_subtitles", 0):
             if manifest.valid("source_subtitle_mask", mask_fingerprint, [regions_path]):
                 payload = json.loads(regions_path.read_text(encoding="utf-8"))
                 regions = [SubtitleRegion(**item) for item in payload.get("regions", [])]

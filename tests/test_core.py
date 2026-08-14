@@ -39,6 +39,15 @@ def test_delivery_encoding_balances_size_and_compatibility():
     assert AUDIO_BITRATE == "128k"
 
 
+def test_default_job_keeps_source_subtitles_and_enables_vietnamese_dub():
+    job = JobCreate(url="https://example.com/video.mp4")
+    assert job.diarize is True
+    assert job.burn_subtitles is True
+    assert job.hide_source_subtitles is False
+    assert job.dub is True
+    assert job.original_audio_volume == 0.08
+
+
 def test_folder_episode_names_use_natural_numeric_order():
     names = ["tap-10.mp4", "tap-2.mp4", "tap-3.mp4", "tap-1.mp4"]
     assert sorted(names, key=natural_filename_key) == ["tap-1.mp4", "tap-2.mp4", "tap-3.mp4", "tap-10.mp4"]

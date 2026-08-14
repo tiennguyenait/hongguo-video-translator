@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import srt
 
-from .adaptive_subtitle import FONT_PATH, generate_adaptive_ass
+from .adaptive_subtitle import FONT_NAME, FONT_PATH, generate_adaptive_ass
 
 if TYPE_CHECKING:
     from .source_subtitle_mask import SubtitleRegion
@@ -101,11 +101,11 @@ def apply_channel_watermark(video: Path, output: Path, logo: Path, channel_name:
     """Apply a restrained top-left logo + channel label calibrated to the reference style."""
     width, height = probe_video_size(video)
     duration = probe_duration(video)
-    logo_size = max(28, round(height * 0.045))
+    logo_size = max(32, round(height * 0.055))
     margin_x = max(10, round(width * 0.012))
     margin_y = max(10, round(height * 0.018))
-    gap = max(8, round(width * 0.006))
-    font_size = max(15, round(height * 0.021))
+    gap = max(8, round(width * 0.007))
+    font_size = max(17, round(height * 0.025))
     opacity = min(0.85, max(0.15, float(opacity)))
     escaped_text = channel_name.replace("\\", "\\\\").replace("'", "'\\''").replace(":", "\\:")
     escaped_font = str(FONT_PATH.resolve()).replace("\\", "\\\\").replace("'", "'\\''").replace(":", "\\:")
@@ -130,7 +130,7 @@ def apply_channel_watermark(video: Path, output: Path, logo: Path, channel_name:
 def _subtitle_filter(path: Path, force_style: bool = True, fonts_dir: Path | None = None) -> str:
     escaped = str(path.resolve()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''").replace(",", "\\,")
     style = (
-        "FontName=Arial,FontSize=11,PrimaryColour=&H00FFFFFF,"
+        f"FontName={FONT_NAME},FontSize=11,PrimaryColour=&H00FFFFFF,"
         "BackColour=&H70000000,OutlineColour=&H00000000,"
         "BorderStyle=3,Outline=1,Shadow=0,Alignment=2,MarginV=28"
     )
@@ -152,7 +152,7 @@ def burn_subtitles(video: Path, subtitle: Path, output: Path, regions: list["Sub
         )
         filters.append(_subtitle_filter(ass_path, force_style=False, fonts_dir=FONT_PATH.parent))
     else:
-        filters.append(_subtitle_filter(subtitle))
+        filters.append(_subtitle_filter(subtitle, fonts_dir=FONT_PATH.parent))
     run_ffmpeg(["ffmpeg", "-y", "-i", str(video), "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "medium", "-crf", VIDEO_CRF, "-c:a", "copy", "-movflags", "+faststart", str(output)])
 
 

@@ -17,13 +17,13 @@ class JobCreate(BaseModel):
     target_language: str = Field(default="Vietnamese", min_length=2, max_length=50)
     glossary: str | None = Field(default=None, max_length=10_000)
     burn_subtitles: bool = True
-    hide_source_subtitles: bool = True
-    dub: bool = False
+    hide_source_subtitles: bool = False
+    dub: bool = True
     narrator_mode: bool = True
     tts_voice: str = Field(default="Ngọc Huyền — authorized clone", max_length=100)
     tts_secondary_voice: str = Field(default="vi-VN-NamMinhNeural", max_length=100)
     voice_overrides: dict[str, Literal["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]] = Field(default_factory=dict)
-    original_audio_volume: float = Field(default=0.0, ge=0.0, le=1.0)
+    original_audio_volume: float = Field(default=0.08, ge=0.0, le=1.0)
 
     @field_validator("url")
     @classmethod
