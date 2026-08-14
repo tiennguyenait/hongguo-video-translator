@@ -31,7 +31,26 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
     actual_ids = [cue.index for cue in subtitles]
     add("subtitle_ids", "pass" if actual_ids == expected_ids else "error", "All subtitle ids preserved" if actual_ids == expected_ids else "Subtitle ids are missing, duplicated, or reordered")
     empty = [cue.index for cue in subtitles if not cue.content.strip()]
-    add("empty_lines", "pass" if not empty else "error", "No empty subtitles" if not empty else f"Empty subtitle ids: {empty}")
+    source_by_id: dict[int, srt.Subtitle] = {}
+    source_path = job_dir / "source.srt"
+    if source_path.is_file():
+        source_by_id = {cue.index: cue for cue in srt.parse(source_path.read_text(encoding="utf-8-sig"))}
+    # Whisper alignment occasionally emits a punctuation mark or one orphaned
+    # CJK character as its own cue. The scene editor may safely absorb its
+    # meaning into adjacent dialogue, leaving this display slot empty. That is a
+    # review warning, not content loss; longer empty source cues remain errors.
+    ignorable_empty = [
+        item_id for item_id in empty
+        if item_id in source_by_id
+        and len(re.sub(r"[^\w\u3400-\u9fff]", "", source_by_id[item_id].content, flags=re.UNICODE)) <= 1
+    ]
+    unsafe_empty = [item_id for item_id in empty if item_id not in ignorable_empty]
+    if unsafe_empty:
+        add("empty_lines", "error", f"Empty subtitle ids: {unsafe_empty}")
+    elif ignorable_empty:
+        add("empty_lines", "warning", f"Ignored empty ASR punctuation/fragments: {ignorable_empty}")
+    else:
+        add("empty_lines", "pass", "No empty subtitles")
     chinese = [cue.index for cue in subtitles if re.search(r"[\u3400-\u9fff]", cue.content)]
     add("untranslated_text", "pass" if not chinese else "warning", "No Chinese text remains" if not chinese else f"Possible untranslated text: {chinese[:20]}")
     invalid_timing = [cue.index for cue in subtitles if cue.start.total_seconds() < 0 or cue.end <= cue.start]

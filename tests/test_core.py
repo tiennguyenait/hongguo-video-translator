@@ -108,6 +108,24 @@ def test_translation_json_parsing_and_validation():
     ) == {1: "Xin chào", 2: "bạn"}
     with pytest.raises(ValueError, match="missing"):
         parse_translation_json('[]', [1])
+    assert parse_translation_json('[{"id":1,"text":"Xin chào"}]', [1, 2], allow_missing=True) == {1: "Xin chào"}
+    with pytest.raises(ValueError, match="extra"):
+        parse_translation_json('[{"id":1,"text":"Xin"},{"id":3,"text":"Chào"}]', [1, 2], allow_missing=True)
+
+
+def test_qa_allows_empty_one_character_asr_fragments_but_not_real_lines(tmp_path):
+    from app.qa import validate_job
+    from app.subtitle import write_srt
+    source = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "。"),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=2), "正常台词"),
+    ]
+    write_srt(tmp_path / "source.srt", source)
+    safe = validate_job(tmp_path, [srt.Subtitle(1, source[0].start, source[0].end, "")], [1], None)
+    assert safe["summary"]["error"] == 0
+    assert next(item for item in safe["checks"] if item["name"] == "empty_lines")["severity"] == "warning"
+    unsafe = validate_job(tmp_path, [srt.Subtitle(2, source[1].start, source[1].end, "")], [2], None)
+    assert unsafe["summary"]["error"] == 1
 
 
 def test_translation_over_budget_is_deferred_to_dialogue_timing(monkeypatch, tmp_path):
@@ -128,6 +146,26 @@ def test_translation_over_budget_is_deferred_to_dialogue_timing(monkeypatch, tmp
     assert translated[0].content.startswith("Trưởng lão")
     assert len(responses) == 2  # initial translation plus one shortening attempt
     assert any("dialogue reflow" in message for message in messages)
+
+
+def test_translation_recovers_only_ids_omitted_by_provider(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"translation_scene_review": False})
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    responses = iter([
+        '{"translations":[{"id":1,"text":"Xin chào."}]}',
+        '{"translations":[{"id":2,"text":"Mời vào."}]}',
+    ])
+    monkeypatch.setattr("app.translator._openai_compatible", lambda *_: next(responses))
+    cues = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "你好"),
+        srt.Subtitle(2, timedelta(seconds=2), timedelta(seconds=4), "请进"),
+    ]
+    messages = []
+    result = translate_subtitles(
+        cues, "deepseek", "Chinese", "Vietnamese", progress=messages.append, job_dir=tmp_path,
+    )
+    assert [cue.content for cue in result] == ["Xin chào.", "Mời vào."]
+    assert "Recovered omitted translation ids: [2]" in messages
 
 
 def test_safe_job_path(monkeypatch, tmp_path: Path):

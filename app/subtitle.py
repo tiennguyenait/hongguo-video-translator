@@ -26,7 +26,7 @@ def read_srt(path: Path) -> list[srt.Subtitle]:
     return list(srt.parse(path.read_text(encoding="utf-8-sig")))
 
 
-def parse_translation_json(raw: str, expected_ids: list[int]) -> dict[int, str]:
+def parse_translation_json(raw: str, expected_ids: list[int], allow_missing: bool = False) -> dict[int, str]:
     cleaned = raw.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.DOTALL | re.IGNORECASE)
     if fenced:
@@ -90,8 +90,8 @@ def parse_translation_json(raw: str, expected_ids: list[int]) -> dict[int, str]:
         if item_id in result:
             raise ValueError(f"Duplicate translation id: {item_id}")
         result[item_id] = item["text"].strip()
-    if set(result) != set(expected_ids):
-        missing = sorted(set(expected_ids) - set(result))
-        extra = sorted(set(result) - set(expected_ids))
+    missing = sorted(set(expected_ids) - set(result))
+    extra = sorted(set(result) - set(expected_ids))
+    if extra or (missing and not allow_missing):
         raise ValueError(f"Translation ids mismatch; missing={missing}, extra={extra}")
     return result

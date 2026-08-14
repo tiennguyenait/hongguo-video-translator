@@ -157,7 +157,23 @@ def translate_subtitles(
         for attempt in range(1, settings.translation_retries + 1):
             try:
                 raw = _gemini(SYSTEM_PROMPT, prompt) if provider == "gemini" else _openai_compatible(provider, SYSTEM_PROMPT, prompt)
-                mapping = parse_translation_json(raw, expected_ids)
+                mapping = parse_translation_json(raw, expected_ids, allow_missing=True)
+                missing_ids = [item_id for item_id in expected_ids if item_id not in mapping]
+                if missing_ids:
+                    missing_items = [item for item in items if item["id"] in missing_ids]
+                    repair_prompt = (
+                        "The previous response omitted these subtitle items. Translate only this JSON array "
+                        "and return every listed id exactly once:\n"
+                        + json.dumps(missing_items, ensure_ascii=False)
+                    )
+                    repair_raw = (
+                        _gemini(SYSTEM_PROMPT, repair_prompt)
+                        if provider == "gemini"
+                        else _openai_compatible(provider, SYSTEM_PROMPT, repair_prompt)
+                    )
+                    mapping.update(parse_translation_json(repair_raw, missing_ids))
+                    if progress:
+                        progress(f"Recovered omitted translation ids: {missing_ids}")
                 untranslated = [item_id for item_id, text in mapping.items() if len(_CJK_RE.findall(text)) > max(1, len(text) * 0.10)]
                 if target_language.lower().startswith("vietnam") and untranslated:
                     raise ValueError(f"Provider left Chinese text untranslated for ids: {untranslated}")
