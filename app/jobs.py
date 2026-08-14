@@ -1,11 +1,12 @@
 import logging
 import json
+import os
 import queue
 import shutil
 import threading
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import srt
 
@@ -30,6 +31,7 @@ OUTPUT_NAMES = {
     "subtitle_regions": "subtitle-regions.json",
     "subtitle_layout": "subtitle-layout.json",
 }
+UPLOAD_EXTENSIONS = {".mp4"}
 
 
 def job_directory(job_id: str) -> Path:
@@ -84,8 +86,8 @@ class JobWorker:
         if self.thread:
             self.thread.join(timeout=10)
 
-    def submit(self, request: JobCreate) -> dict[str, Any]:
-        job_id, now = str(uuid.uuid4()), utc_now()
+    def _submit(self, request: JobCreate, job_id: str | None = None) -> dict[str, Any]:
+        job_id, now = job_id or str(uuid.uuid4()), utc_now()
         values = {
             "id": job_id, "url": request.url, "status": JobStatus.QUEUED, "step": JobStep.QUEUED,
             "progress_message": "Waiting for worker", "error": None, "provider": request.provider,
@@ -100,10 +102,44 @@ class JobWorker:
             "original_audio_volume": request.original_audio_volume,
             "created_at": now, "updated_at": now,
         }
-        job_directory(job_id).mkdir(parents=True)
+        job_directory(job_id).mkdir(parents=True, exist_ok=True)
         row = db_create_job(values)
         self.queue.put(job_id)
         return row
+
+    def submit(self, request: JobCreate) -> dict[str, Any]:
+        return self._submit(request)
+
+    def submit_upload(self, request: JobCreate, filename: str, stream: BinaryIO) -> dict[str, Any]:
+        suffix = Path(filename or "").suffix.lower()
+        if suffix not in UPLOAD_EXTENSIONS:
+            raise ValueError("Only MP4 uploads are supported")
+        job_id = str(uuid.uuid4())
+        directory = job_directory(job_id)
+        directory.mkdir(parents=True)
+        temporary = directory / ".source.uploading"
+        output = directory / "source.mp4"
+        total = 0
+        try:
+            with temporary.open("wb") as target:
+                while chunk := stream.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > get_settings().max_upload_bytes:
+                        raise ValueError("Uploaded video exceeds the 5 GiB limit")
+                    target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            if total < 1024:
+                raise ValueError("Uploaded video is empty or truncated")
+            os.replace(temporary, output)
+            duration = media.probe_duration(output)
+            if duration <= 0:
+                raise ValueError("Uploaded MP4 has no readable video duration")
+            upload_request = request.model_copy(update={"url": f"upload://{Path(filename).name}"})
+            return self._submit(upload_request, job_id)
+        except Exception:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
 
     def is_active(self, job_id: str) -> bool:
         with self._lock:
@@ -144,13 +180,16 @@ class JobWorker:
         job_id = job["id"]
         directory = job_directory(job_id)
         manifest = ArtifactManifest(directory)
-        self._progress(job_id, JobStep.DOWNLOADING, "Downloading video")
+        uploaded = str(job["url"]).startswith("upload://")
+        self._progress(job_id, JobStep.DOWNLOADING, "Validating uploaded video" if uploaded else "Downloading video")
 
         def download_progress(info):
             if info.get("status") == "downloading" and info.get("_percent_str"):
                 self._progress(job_id, JobStep.DOWNLOADING, f"Downloading {info['_percent_str'].strip()}")
 
-        video = downloader.download_video(job["url"], directory, download_progress)
+        video = directory / "source.mp4" if uploaded else downloader.download_video(job["url"], directory, download_progress)
+        if uploaded and (not video.is_file() or video.stat().st_size < 1024):
+            raise RuntimeError("Uploaded source.mp4 is missing or truncated")
         manifest.complete("download", stable_hash({"url": job["url"]}), [video], {"bytes": video.stat().st_size})
         source_srt = directory / "source.srt"
         speakers_path = directory / "speakers.json"

@@ -1,6 +1,6 @@
 # Hongguo Video Translator
 
-FastAPI server tải video Hongguo/direct MP4/M3U8, nhận dạng và forced-align lời thoại bằng WhisperX, tùy chọn speaker diarization bằng pyannote, dịch hai lượt có ngữ cảnh sang tiếng Việt, burn subtitle và tạo bản thuyết minh VieNeu-TTS chạy local. Metadata được lưu trong SQLite; một worker thread xử lý đúng một job tại một thời điểm để bảo vệ GPU.
+FastAPI server nhận video upload MP4 hoặc tải từ Hongguo/direct MP4/M3U8, nhận dạng và forced-align lời thoại bằng WhisperX, tùy chọn speaker diarization bằng pyannote, dịch hai lượt có ngữ cảnh sang tiếng Việt, burn subtitle và tạo bản thuyết minh VieNeu-TTS chạy local. Metadata được lưu trong SQLite; một worker thread xử lý đúng một job tại một thời điểm để bảo vệ GPU.
 
 Pipeline 2.0 có checkpoint nguyên tử, cache TTS theo fingerprint, semantic dialogue units, sửa fragment diarization, text normalization riêng cho cách đọc, speech timing plan, tự phát hiện/che phụ đề gốc, FFmpeg sidechain ducking/loudness và QA tự động. Job bị gián đoạn tiếp tục từ artifact hợp lệ gần nhất.
 
@@ -51,6 +51,14 @@ curl -X POST http://127.0.0.1:8000/api/jobs \
     "tts_voice":"Ngọc Linh",
     "original_audio_volume":0.0
   }'
+```
+
+Upload MP4 trực tiếp (tối đa 5 GiB):
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/jobs/upload \
+  -F 'video=@/path/to/video.mp4;type=video/mp4' \
+  -F 'options={"provider":"deepseek","asr_model":"large-v3","diarize":true,"burn_subtitles":true,"dub":true}'
 ```
 
 - `GET /api/jobs` — job gần đây

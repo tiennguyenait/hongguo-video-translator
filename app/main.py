@@ -1,8 +1,10 @@
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from pydantic import ValidationError
 from fastapi.responses import FileResponse
 
 from .database import delete_job, get_job, init_db, list_jobs, recover_interrupted_jobs
@@ -53,6 +55,23 @@ def cloned_voice_demo():
 @app.post("/api/jobs", response_model=JobResponse, status_code=201)
 def create_job(request: JobCreate):
     return serialize_job(worker.submit(request))
+
+
+@app.post("/api/jobs/upload", response_model=JobResponse, status_code=201)
+def create_upload_job(video: UploadFile = File(...), options: str = Form("{}")):
+    try:
+        payload = json.loads(options)
+        if not isinstance(payload, dict):
+            raise ValueError("Upload options must be a JSON object")
+        payload.pop("url", None)
+        request = JobCreate(url="https://upload.local/source.mp4", **payload)
+        return serialize_job(worker.submit_upload(request, video.filename or "video.mp4", video.file))
+    except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+        message = str(exc)
+        status = 413 if "5 GiB" in message else 400
+        raise HTTPException(status, message) from exc
+    finally:
+        video.file.close()
 
 
 @app.get("/api/jobs", response_model=list[JobResponse])

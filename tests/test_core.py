@@ -1,4 +1,5 @@
 from datetime import timedelta
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -6,7 +7,8 @@ import pytest
 import srt
 
 from app.config import get_settings
-from app.jobs import apply_subtitle_review, safe_job_file
+from app.jobs import JobWorker, apply_subtitle_review, safe_job_file
+from app.schemas import JobCreate
 from app.subtitle import parse_translation_json, segments_to_subtitles
 from app.speech_pipeline import _group_words
 from app.tts import _fit_audio_to_window, build_utterances
@@ -67,6 +69,30 @@ def test_safe_job_path(monkeypatch, tmp_path: Path):
     assert safe_job_file("abc", "source.mp4") == expected
     with pytest.raises(ValueError):
         safe_job_file("abc", "../jobs.sqlite3")
+
+
+def test_uploaded_mp4_is_saved_before_job_is_queued(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"jobs_dir": tmp_path, "max_upload_bytes": 4096})
+    monkeypatch.setattr("app.jobs.get_settings", lambda: settings)
+    monkeypatch.setattr("app.jobs.media.probe_duration", lambda _: 1.0)
+    monkeypatch.setattr("app.jobs.db_create_job", lambda values: values)
+    worker = JobWorker()
+    row = worker.submit_upload(JobCreate(url="https://upload.local/source.mp4"), "clip.mp4", BytesIO(b"x" * 2048))
+    output = tmp_path / row["id"] / "source.mp4"
+    assert output.read_bytes() == b"x" * 2048
+    assert row["url"] == "upload://clip.mp4"
+    assert worker.queue.get_nowait() == row["id"]
+
+
+def test_upload_rejects_wrong_extension_and_oversize(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"jobs_dir": tmp_path, "max_upload_bytes": 1024})
+    monkeypatch.setattr("app.jobs.get_settings", lambda: settings)
+    worker = JobWorker()
+    with pytest.raises(ValueError, match="Only MP4"):
+        worker.submit_upload(JobCreate(url="https://upload.local/source.mp4"), "clip.exe", BytesIO(b"x" * 2048))
+    with pytest.raises(ValueError, match="5 GiB"):
+        worker.submit_upload(JobCreate(url="https://upload.local/source.mp4"), "clip.mp4", BytesIO(b"x" * 2048))
+    assert not list(tmp_path.iterdir())
 
 
 def test_utterances_join_only_same_speaker():

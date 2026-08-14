@@ -22,6 +22,7 @@ class Settings(BaseModel):
     vieneu_python: Path = Path("/workspace/vieneu-tts/.venv/bin/python")
     vieneu_runner: Path = SERVER_DIR / "scripts" / "vieneu_batch.py"
     narrator_reference: Path = SERVER_DIR / "data" / "voices" / "ngoc-huyen-authorized-reference.wav"
+    max_upload_bytes: int = 5 * 1024 * 1024 * 1024
 
 
 @lru_cache
