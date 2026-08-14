@@ -71,3 +71,20 @@ class SubtitleEdit(BaseModel):
 
 class JobReview(BaseModel):
     translations: list[SubtitleEdit] = Field(min_length=1, max_length=5000)
+
+
+class BatchEpisode(BaseModel):
+    position: int
+    filename: str
+    job: JobResponse
+
+
+class BatchResponse(BaseModel):
+    id: str
+    status: str
+    progress_message: str
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+    output: str | None
+    episodes: list[BatchEpisode]

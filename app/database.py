@@ -54,6 +54,27 @@ def init_db() -> None:
             db.execute("ALTER TABLE jobs ADD COLUMN narrator_mode INTEGER NOT NULL DEFAULT 1")
         if "hide_source_subtitles" not in columns:
             db.execute("ALTER TABLE jobs ADD COLUMN hide_source_subtitles INTEGER NOT NULL DEFAULT 1")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS batches (
+                id TEXT PRIMARY KEY, status TEXT NOT NULL, progress_message TEXT NOT NULL,
+                error TEXT, burn_subtitles INTEGER NOT NULL, dub INTEGER NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS batch_jobs (
+                batch_id TEXT NOT NULL, job_id TEXT NOT NULL UNIQUE,
+                position INTEGER NOT NULL, filename TEXT NOT NULL,
+                PRIMARY KEY (batch_id, position),
+                FOREIGN KEY (batch_id) REFERENCES batches(id),
+                FOREIGN KEY (job_id) REFERENCES jobs(id)
+            )"""
+        )
+        batch_columns = {row["name"] for row in db.execute("PRAGMA table_info(batches)").fetchall()}
+        if "channel_name" not in batch_columns:
+            db.execute("ALTER TABLE batches ADD COLUMN channel_name TEXT NOT NULL DEFAULT ''")
+        if "watermark_opacity" not in batch_columns:
+            db.execute("ALTER TABLE batches ADD COLUMN watermark_opacity REAL NOT NULL DEFAULT 0.58")
 
 
 def create_job(values: dict[str, Any]) -> dict[str, Any]:
@@ -86,6 +107,51 @@ def update_job(job_id: str, **values: Any) -> None:
 def delete_job(job_id: str) -> None:
     with connect() as db:
         db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+
+
+def create_batch(values: dict[str, Any]) -> dict[str, Any]:
+    columns = ", ".join(values)
+    placeholders = ", ".join("?" for _ in values)
+    with connect() as db:
+        db.execute(f"INSERT INTO batches ({columns}) VALUES ({placeholders})", tuple(values.values()))
+    return get_batch(values["id"])  # type: ignore[return-value]
+
+
+def add_batch_job(batch_id: str, job_id: str, position: int, filename: str) -> None:
+    with connect() as db:
+        db.execute(
+            "INSERT INTO batch_jobs (batch_id, job_id, position, filename) VALUES (?, ?, ?, ?)",
+            (batch_id, job_id, position, filename),
+        )
+
+
+def get_batch(batch_id: str) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_batch_jobs(batch_id: str) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            """SELECT bj.position, bj.filename, j.* FROM batch_jobs bj
+               JOIN jobs j ON j.id = bj.job_id WHERE bj.batch_id = ? ORDER BY bj.position""",
+            (batch_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_job_batch(job_id: str) -> str | None:
+    with connect() as db:
+        row = db.execute("SELECT batch_id FROM batch_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    return str(row["batch_id"]) if row else None
+
+
+def update_batch(batch_id: str, **values: Any) -> None:
+    values["updated_at"] = utc_now()
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with connect() as db:
+        db.execute(f"UPDATE batches SET {assignments} WHERE id = ?", (*values.values(), batch_id))
 
 
 def recover_interrupted_jobs() -> None:

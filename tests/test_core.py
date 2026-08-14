@@ -1,5 +1,6 @@
 from datetime import timedelta
 from io import BytesIO
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +23,8 @@ from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
 from app.source_subtitle_mask import SubtitleRegion
 from app.dialogue_master import build_dialogue_master
 from app.translator import translate_subtitles
-from app.media import AUDIO_BITRATE, VIDEO_CRF
+from app.media import AUDIO_BITRATE, VIDEO_CRF, apply_channel_watermark, concat_videos, probe_duration, probe_video_size
+from app.batching import natural_filename_key
 
 
 def test_srt_timestamp_conversion():
@@ -35,6 +37,45 @@ def test_srt_timestamp_conversion():
 def test_delivery_encoding_balances_size_and_compatibility():
     assert VIDEO_CRF == "23"
     assert AUDIO_BITRATE == "128k"
+
+
+def test_folder_episode_names_use_natural_numeric_order():
+    names = ["tap-10.mp4", "tap-2.mp4", "tap-3.mp4", "tap-1.mp4"]
+    assert sorted(names, key=natural_filename_key) == ["tap-1.mp4", "tap-2.mp4", "tap-3.mp4", "tap-10.mp4"]
+
+
+def test_concat_videos_normalizes_different_episode_sizes(tmp_path):
+    episodes = []
+    for index, size in enumerate(("160x90", "120x90"), 1):
+        path = tmp_path / f"episode-{index}.mp4"
+        subprocess.run([
+            "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c=black:s={size}:d=0.4:r=30",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.4",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path),
+        ], check=True)
+        episodes.append(path)
+    output = tmp_path / "combined.mp4"
+    concat_videos(episodes, output)
+    assert probe_video_size(output) == (160, 90)
+    assert 0.7 < probe_duration(output) < 1.0
+
+
+def test_channel_watermark_renders_and_preserves_timing(tmp_path):
+    from PIL import Image, ImageDraw
+    source, logo, output = tmp_path / "source.mp4", tmp_path / "logo.png", tmp_path / "branded.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=320x180:d=0.6:r=30",
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.6",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(source),
+    ], check=True)
+    image = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+    ImageDraw.Draw(image).ellipse((4, 4, 124, 124), fill=(235, 61, 82, 255))
+    image.save(logo)
+    apply_channel_watermark(source, output, logo, "KÊNH REVIEW", 0.58)
+    assert output.is_file()
+    assert probe_video_size(output) == (320, 180)
+    assert abs(probe_duration(output) - probe_duration(source)) < 0.08
+    subprocess.run(["ffmpeg", "-v", "error", "-i", str(output), "-f", "null", "-"], check=True)
 
 
 def test_translation_json_parsing_and_validation():

@@ -61,12 +61,26 @@ curl -X POST http://127.0.0.1:8000/api/jobs/upload \
   -F 'options={"provider":"deepseek","asr_model":"large-v3","diarize":true,"burn_subtitles":true,"dub":true}'
 ```
 
+Upload cả folder, tự sắp theo số tập, xử lý tuần tự, ghép và gắn thương hiệu một lần ở video cuối:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/batches/upload \
+  -F 'videos=@/path/tap-2.mp4;type=video/mp4' \
+  -F 'videos=@/path/tap-10.mp4;type=video/mp4' \
+  -F 'logo=@/path/logo.png;type=image/png' \
+  -F 'options={"provider":"deepseek","asr_model":"large-v3","burn_subtitles":true,"dub":false,"channel_name":"KÊNH REVIEW PHIM","watermark_opacity":0.58}'
+```
+
+Tên file được natural-sort (`tap-2` đứng trước `tap-10`), tối đa 200 MP4. Logo tối đa 5 MiB; nên dùng PNG vuông có nền trong suốt. Logo và chữ nằm ở góc trên trái, cùng opacity mặc định `0.58`. Phải gửi cả `channel_name` và `logo`, hoặc bỏ trống cả hai.
+
 - `GET /api/jobs` — job gần đây
 - `GET /api/jobs/{id}` — trạng thái và output hiện có
 - `GET /api/jobs/{id}/files/{filename}` — tải output được phép
 - `GET /api/jobs/{id}/subtitles` — lấy source/translation để review
 - `PATCH /api/jobs/{id}/subtitles` — lưu câu sửa và render lại từ checkpoint
 - `DELETE /api/jobs/{id}` — xóa job đã done/failed và toàn bộ file
+- `GET /api/batches/{id}` — trạng thái từng tập và video ghép
+- `GET /api/batches/{id}/files/{filename}` — tải video cuối của batch
 
 Job đang queued/running không thể bị xóa. Khi server restart, job đang chạy được đưa lại vào hàng đợi. Đường dẫn tải chỉ chấp nhận tên output định trước và không cho traversal.
 

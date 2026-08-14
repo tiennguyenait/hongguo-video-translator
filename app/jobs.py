@@ -10,7 +10,7 @@ from typing import Any, BinaryIO
 
 import srt
 
-from . import dialogue_master, downloader, media, qa, speech_pipeline, translator, tts
+from . import batching, dialogue_master, downloader, media, qa, speech_pipeline, translator, tts
 from .artifacts import ArtifactManifest, stable_hash
 from .artifacts import atomic_write_json
 from .dialogue import build_dialogue_units, repair_fragment_speakers
@@ -172,6 +172,10 @@ class JobWorker:
                 logger.exception("Job %s failed", job_id)
                 update_job(job_id, status=JobStatus.FAILED, progress_message="Job failed", error=str(exc))
             finally:
+                try:
+                    batching.finalize_batch_for_job(job_id)
+                except Exception:
+                    logger.exception("Cannot update folder batch for job %s", job_id)
                 with self._lock:
                     self.active_job_id = None
                 self.queue.task_done()
