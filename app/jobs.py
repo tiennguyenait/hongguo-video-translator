@@ -7,7 +7,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from . import downloader, media, speech_pipeline, translator, tts
+from . import downloader, media, qa, speech_pipeline, translator, tts
+from .artifacts import ArtifactManifest, stable_hash
+from .artifacts import atomic_write_json
+from .dialogue import build_dialogue_units, repair_fragment_speakers
 from .config import get_settings
 from .database import create_job as db_create_job
 from .database import get_job, list_jobs, update_job, utc_now
@@ -20,6 +23,7 @@ OUTPUT_NAMES = {
     "video": "source.mp4", "source_srt": "source.srt", "translated_srt": "vi.srt",
     "burned_video": "vi-burned.mp4", "dubbed_video": "vi-dubbed.mp4",
     "speaker_report": "voice-profiles.json",
+    "qa_report": "qa-report.json",
 }
 
 
@@ -99,6 +103,13 @@ class JobWorker:
         with self._lock:
             return self.active_job_id == job_id
 
+    def retry(self, job_id: str, message: str = "Queued for render from checkpoint") -> None:
+        row = get_job(job_id)
+        if not row or row["status"] not in {JobStatus.DONE, JobStatus.FAILED, JobStatus.NEEDS_REVIEW}:
+            raise ValueError("Only a completed, failed, or review job can be retried")
+        update_job(job_id, status=JobStatus.QUEUED, step=JobStep.QUEUED, progress_message=message, error=None)
+        self.queue.put(job_id)
+
     def _progress(self, job_id: str, step: JobStep, message: str) -> None:
         logger.info("job=%s step=%s %s", job_id, step, message)
         update_job(job_id, status=JobStatus.RUNNING, step=step, progress_message=message)
@@ -126,6 +137,7 @@ class JobWorker:
     def _process(self, job: dict[str, Any]) -> None:
         job_id = job["id"]
         directory = job_directory(job_id)
+        manifest = ArtifactManifest(directory)
         self._progress(job_id, JobStep.DOWNLOADING, "Downloading video")
 
         def download_progress(info):
@@ -133,6 +145,7 @@ class JobWorker:
                 self._progress(job_id, JobStep.DOWNLOADING, f"Downloading {info['_percent_str'].strip()}")
 
         video = downloader.download_video(job["url"], directory, download_progress)
+        manifest.complete("download", stable_hash({"url": job["url"]}), [video], {"bytes": video.stat().st_size})
         source_srt = directory / "source.srt"
         speakers_path = directory / "speakers.json"
         if source_srt.is_file():
@@ -146,31 +159,87 @@ class JobWorker:
                 job.get("min_speakers"), job.get("max_speakers"),
                 lambda message: self._progress(job_id, JobStep.TRANSCRIBING, message),
             )
-        self._progress(job_id, JobStep.TRANSLATING, f"Translating {len(subtitles)} cues via {job['provider']}")
-        translated = translator.translate_subtitles(
-            subtitles, job["provider"], job["source_language"], job["target_language"], job["glossary"],
-            lambda message: self._progress(job_id, JobStep.TRANSLATING, message),
-            speakers,
+        manifest.complete(
+            "transcript", stable_hash({"video_bytes": video.stat().st_size, "model": job["asr_model"], "language": job["source_language_code"], "diarize": bool(job.get("diarize"))}),
+            [source_srt], {"cues": len(subtitles)},
         )
+        speakers = repair_fragment_speakers(subtitles, speakers)
+        speakers_path.write_text(json.dumps(speakers, ensure_ascii=False, indent=2), encoding="utf-8")
+        units = build_dialogue_units(subtitles, speakers)
+        (directory / "dialogue-units.json").write_text(json.dumps([unit.to_dict() for unit in units], ensure_ascii=False, indent=2), encoding="utf-8")
+        self._progress(job_id, JobStep.TRANSLATING, f"Translating {len(subtitles)} cues via {job['provider']}")
         translated_srt = directory / "vi.srt"
-        write_srt(translated_srt, translated)
-        if job["burn_subtitles"]:
-            self._progress(job_id, JobStep.BURNING, "Burning Vietnamese subtitles into video")
-            media.burn_subtitles(video, translated_srt, directory / "vi-burned.mp4")
-        if job["dub"]:
-            self._progress(job_id, JobStep.DUBBING, "Creating Vietnamese basic dub")
-            dub_video_base = directory / "vi-burned.mp4" if job["burn_subtitles"] else video
-            tts.create_dub(
-                dub_video_base, translated, directory, job["tts_voice"], job["original_audio_volume"],
-                lambda message: self._progress(job_id, JobStep.DUBBING, message),
-                speakers, job.get("tts_secondary_voice", "vi-VN-NamMinhNeural"),
-                json.loads(job.get("voice_overrides") or "{}"),
-                bool(job.get("narrator_mode", 1)),
+        translation_fingerprint = stable_hash({"source": [(cue.index, cue.content) for cue in subtitles], "provider": job["provider"], "target": job["target_language"], "glossary": job["glossary"], "pipeline": "context-v2"})
+        if manifest.valid("translation", translation_fingerprint, [translated_srt, directory / "vi-final.json"]):
+            self._progress(job_id, JobStep.TRANSLATING, "Resuming from context-edited Vietnamese translation")
+            translated = read_srt(translated_srt)
+        else:
+            translated = translator.translate_subtitles(
+                subtitles, job["provider"], job["source_language"], job["target_language"], job["glossary"],
+                lambda message: self._progress(job_id, JobStep.TRANSLATING, message),
+                speakers, directory,
             )
-        update_job(job_id, status=JobStatus.DONE, step=JobStep.DONE, progress_message="All requested outputs are ready", error=None)
+            write_srt(translated_srt, translated)
+            manifest.complete("translation", translation_fingerprint, [translated_srt, directory / "vi-final.json"], {"cues": len(translated)})
+        if job["burn_subtitles"]:
+            burned = directory / "vi-burned.mp4"
+            burn_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "srt": translated_srt.read_text(encoding="utf-8"), "style": "boxed-v2"})
+            if manifest.valid("burn", burn_fingerprint, [burned]):
+                self._progress(job_id, JobStep.BURNING, "Resuming from burned subtitle video")
+            else:
+                self._progress(job_id, JobStep.BURNING, "Burning Vietnamese subtitles into video")
+                media.burn_subtitles(video, translated_srt, burned)
+                manifest.complete("burn", burn_fingerprint, [burned])
+        if job["dub"]:
+            dub_video_base = directory / "vi-burned.mp4" if job["burn_subtitles"] else video
+            dubbed = directory / "vi-dubbed.mp4"
+            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "sidechain-v3-48k"})
+            if manifest.valid("dub", dub_fingerprint, [dubbed, directory / "speech-plan.json", directory / "tts-timing.json"]):
+                self._progress(job_id, JobStep.DUBBING, "Resuming from cached Vietnamese dub")
+            else:
+                self._progress(job_id, JobStep.DUBBING, "Creating Vietnamese natural dub")
+                tts.create_dub(
+                    dub_video_base, translated, directory, job["tts_voice"], job["original_audio_volume"],
+                    lambda message: self._progress(job_id, JobStep.DUBBING, message),
+                    speakers, job.get("tts_secondary_voice", "vi-VN-NamMinhNeural"),
+                    json.loads(job.get("voice_overrides") or "{}"),
+                    bool(job.get("narrator_mode", 1)),
+                )
+                manifest.complete("dub", dub_fingerprint, [dubbed, directory / "speech-plan.json", directory / "tts-timing.json"])
+        self._progress(job_id, JobStep.QA, "Running automatic content, timing, and media QA")
+        final_video = directory / "vi-dubbed.mp4" if job["dub"] else directory / "vi-burned.mp4" if job["burn_subtitles"] else video
+        report = qa.validate_job(directory, translated, [cue.index for cue in subtitles], final_video)
+        manifest.complete("qa", stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "output_bytes": final_video.stat().st_size}), [directory / "qa-report.json"], report["summary"])
+        status = JobStatus.NEEDS_REVIEW if report["summary"]["error"] else JobStatus.DONE
+        message = f"QA complete: {report['summary']['pass']} passed, {report['summary']['warning']} warnings, {report['summary']['error']} errors"
+        update_job(job_id, status=status, step=JobStep.DONE, progress_message=message, error=None)
 
 
 worker = JobWorker()
+
+
+def apply_subtitle_review(job_id: str, edits: dict[int, str]) -> None:
+    directory = job_directory(job_id)
+    translated_path = directory / "vi.srt"
+    if not translated_path.is_file():
+        raise ValueError("Vietnamese subtitles are not available")
+    subtitles = read_srt(translated_path)
+    known = {cue.index for cue in subtitles}
+    unknown = sorted(set(edits) - known)
+    if unknown:
+        raise ValueError(f"Unknown subtitle ids: {unknown}")
+    for cue in subtitles:
+        if cue.index in edits:
+            cue.content = edits[cue.index].strip()
+    write_srt(translated_path, subtitles)
+    atomic_write_json(directory / "vi-final.json", [{"id": cue.index, "text": cue.content} for cue in subtitles])
+    manifest = ArtifactManifest(directory)
+    translation = manifest.data.get("artifacts", {}).get("translation")
+    if translation:
+        manifest.complete("translation", translation["fingerprint"], [translated_path, directory / "vi-final.json"], {"cues": len(subtitles), "human_reviewed": True})
+    manifest.invalidate_after(["download", "transcript", "translation", "burn", "dub", "qa"], "translation")
+    for filename in ("vi-burned.mp4", "vi-dubbed.mp4", "qa-report.json"):
+        (directory / filename).unlink(missing_ok=True)
 
 
 def remove_job_files(job_id: str) -> None:

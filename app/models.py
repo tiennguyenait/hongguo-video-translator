@@ -6,6 +6,7 @@ class JobStatus(StrEnum):
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
+    NEEDS_REVIEW = "needs_review"
 
 
 class JobStep(StrEnum):
@@ -15,4 +16,5 @@ class JobStep(StrEnum):
     TRANSLATING = "translating"
     BURNING = "burning"
     DUBBING = "dubbing"
+    QA = "qa"
     DONE = "done"

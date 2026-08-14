@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import subprocess
+import shutil
 from pathlib import Path
 
 import edge_tts
@@ -11,6 +12,8 @@ from pydub import AudioSegment
 from .media import mux_delayed_clips, probe_duration
 from .config import get_settings
 from .voice_profiles import classify_speaker_voices
+from .artifacts import atomic_write_json, stable_hash
+from .speech_plan import build_speech_plans
 
 
 def _fit_audio_to_window(audio: AudioSegment, target_ms: int, work_path: Path) -> AudioSegment:
@@ -98,19 +101,30 @@ def build_utterances(subtitles: list[srt.Subtitle], speakers: dict[int, str]) ->
     return utterances
 
 
-def _synthesize_local_batch(utterances: list[tuple[srt.Subtitle, str | None]], voice: str, clips_dir: Path) -> None:
+def _synthesize_local_batch(items: list[dict], voice: str, clips_dir: Path) -> None:
     settings = get_settings()
     if not settings.vieneu_python.is_file() or not settings.vieneu_runner.is_file():
         raise RuntimeError("VieNeu local TTS is not installed")
     local_voice = voice if not voice.startswith("vi-VN-") else "Ngọc Linh"
     manifest = clips_dir / "vieneu-input.json"
-    manifest.write_text(
-        json.dumps(
-            [{"id": cue.index, "text": cue.content} for cue, _ in utterances],
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+    reference_stamp = None
+    if settings.narrator_reference.is_file():
+        stat = settings.narrator_reference.stat()
+        reference_stamp = [stat.st_size, stat.st_mtime_ns]
+    cache_keys: dict[int, str] = {}
+    missing: list[dict] = []
+    for item in items:
+        key = stable_hash({"text": item["text"], "voice": voice, "reference": reference_stamp, "engine": "vieneu-v3-turbo"})
+        cache_keys[item["id"]] = key
+        cached = settings.tts_cache_dir / f"{key}.wav"
+        output = clips_dir / f"{item['id']:06d}.wav"
+        if cached.is_file() and cached.stat().st_size > 512:
+            shutil.copy2(cached, output)
+        else:
+            missing.append(item)
+    if not missing:
+        return
+    manifest.write_text(json.dumps(missing, ensure_ascii=False), encoding="utf-8")
     result = subprocess.run(
         [
             str(settings.vieneu_python), str(settings.vieneu_runner), str(manifest), str(clips_dir), local_voice,
@@ -120,9 +134,14 @@ def _synthesize_local_batch(utterances: list[tuple[srt.Subtitle, str | None]], v
     )
     if result.returncode:
         raise RuntimeError(f"VieNeu local TTS failed: {result.stderr.strip()[-3000:]}")
-    missing = [cue.index for cue, _ in utterances if not (clips_dir / f"{cue.index:06d}.wav").is_file()]
-    if missing:
-        raise RuntimeError(f"VieNeu did not create clips: {missing}")
+    missing_ids = [item["id"] for item in items if not (clips_dir / f"{item['id']:06d}.wav").is_file()]
+    if missing_ids:
+        raise RuntimeError(f"VieNeu did not create clips: {missing_ids}")
+    for item in missing:
+        output = clips_dir / f"{item['id']:06d}.wav"
+        cached = settings.tts_cache_dir / f"{cache_keys[item['id']]}.wav"
+        if not cached.exists():
+            shutil.copy2(output, cached)
 
 
 def create_dub(
@@ -150,26 +169,35 @@ def create_dub(
     else:
         profiles = classify_speaker_voices(video, subtitles, speakers, voice, secondary_voice, voice_overrides)
     utterances = build_utterances(subtitles, speakers)
+    plans = build_speech_plans(utterances, video_duration_ms)
+    atomic_write_json(job_dir / "speech-plan.json", [plan.to_dict() for plan in plans])
     if narrator_mode:
-        _synthesize_local_batch(utterances, voice, clips_dir)
+        _synthesize_local_batch([{"id": plan.id, "text": plan.spoken_text} for plan in plans], voice, clips_dir)
     fitted_dir = clips_dir / "fitted"
     fitted_dir.mkdir(exist_ok=True)
     delayed_clips: list[tuple[Path, int]] = []
+    timing_report: list[dict] = []
     for number, (cue, speaker) in enumerate(utterances, 1):
+        plan = plans[number - 1]
         clip_path = clips_dir / f"{cue.index:06d}.{'wav' if narrator_mode else 'mp3'}"
         cue_voice = profiles.get(speaker, {}).get("voice", voice)
         if not narrator_mode:
             asyncio.run(_synthesize(cue, cue_voice, clip_path, narrator_mode))
         audio = AudioSegment.from_file(clip_path)
-        next_start = int(utterances[number][0].start.total_seconds() * 1000) if number < len(utterances) else video_duration_ms
-        available_ms = max(1, next_start - int(cue.start.total_seconds() * 1000))
-        speech_window_ms = max(250, int((cue.end - cue.start).total_seconds() * 1000))
-        audio = _fit_audio_to_window(audio, min(available_ms, speech_window_ms), clip_path)
+        original_ms = len(audio)
+        target_window = max(plan.target_duration_ms, min(plan.hard_deadline_ms, round(plan.target_duration_ms * 1.18)))
+        audio = _fit_audio_to_window(audio, target_window, clip_path)
         fitted_path = fitted_dir / f"{cue.index:06d}.wav"
         audio.set_frame_rate(48000).set_channels(1).set_sample_width(2).export(fitted_path, format="wav")
-        delayed_clips.append((fitted_path, int(cue.start.total_seconds() * 1000)))
+        delayed_clips.append((fitted_path, plan.start_ms))
+        timing_report.append({
+            "id": plan.id, "predicted_ms": plan.predicted_duration_ms, "original_ms": original_ms,
+            "fitted_ms": len(audio), "target_ms": plan.target_duration_ms, "hard_deadline_ms": plan.hard_deadline_ms,
+            "tempo": round(original_ms / max(1, len(audio)), 4), "overflow_ms": max(0, len(audio) - plan.hard_deadline_ms),
+        })
         if progress and (number == len(utterances) or number % 5 == 0):
             progress(f"Synthesized {number}/{len(utterances)} natural utterances")
+    atomic_write_json(job_dir / "tts-timing.json", timing_report)
     output = job_dir / "vi-dubbed.mp4"
     mux_delayed_clips(video, delayed_clips, output, original_audio_volume)
     return output

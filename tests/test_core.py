@@ -3,12 +3,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import srt
 
 from app.config import get_settings
-from app.jobs import safe_job_file
+from app.jobs import apply_subtitle_review, safe_job_file
 from app.subtitle import parse_translation_json, segments_to_subtitles
 from app.speech_pipeline import _group_words
 from app.tts import _fit_audio_to_window, build_utterances
+from app.artifacts import ArtifactManifest, stable_hash
+from app.dialogue import build_dialogue_units, repair_fragment_speakers
+from app.speech_plan import build_speech_plans, predict_duration_ms
+from app.text_normalizer import normalize_spoken_text, vietnamese_integer
 
 
 def test_srt_timestamp_conversion():
@@ -81,6 +86,71 @@ def test_utterances_stop_at_complete_sentence():
     ]
     utterances = build_utterances(cues, {1: "A", 2: "A"})
     assert [item.content for item, _ in utterances] == ["Bí mật đã lộ.", "Cô lập tức bỏ chạy."]
+
+
+def test_dialogue_units_respect_speaker_sentence_and_scene_boundaries():
+    cues = [
+        srt.Subtitle(1, timedelta(seconds=0), timedelta(seconds=1), "Anh có"),
+        srt.Subtitle(2, timedelta(seconds=1.1), timedelta(seconds=2), "nhớ em không?"),
+        srt.Subtitle(3, timedelta(seconds=2.1), timedelta(seconds=3), "Tất nhiên."),
+        srt.Subtitle(4, timedelta(seconds=6), timedelta(seconds=7), "Ba năm sau"),
+    ]
+    units = build_dialogue_units(cues, {1: "A", 2: "A", 3: "B", 4: "B"})
+    assert [(unit.cue_ids, unit.scene_id) for unit in units] == [([1, 2], 1), ([3], 1), ([4], 2)]
+
+
+def test_short_contiguous_asr_tail_inherits_previous_speaker():
+    cues = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "拔剑的速"),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=1.4), "度"),
+    ]
+    assert repair_fragment_speakers(cues, {1: "A", 2: "B"}) == {1: "A", 2: "A"}
+
+
+def test_vietnamese_spoken_normalization_handles_units():
+    assert vietnamese_integer(10) == "mười"
+    assert vietnamese_integer(125) == "một trăm hai mươi lăm"
+    assert normalize_spoken_text("Căn hộ rộng 10m², giảm 20%.") == "Căn hộ rộng mười mét vuông, giảm hai mươi phần trăm."
+
+
+def test_speech_plan_keeps_display_text_separate_from_spoken_text():
+    utterance = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "Phòng rộng 10m2.")
+    plans = build_speech_plans([(utterance, "A")], 3000)
+    assert plans[0].subtitle_text == "Phòng rộng 10m2."
+    assert plans[0].spoken_text == "Phòng rộng mười mét vuông."
+    assert plans[0].hard_deadline_ms == 3000
+    assert predict_duration_ms("Xin chào!") > 0
+
+
+def test_artifact_manifest_requires_matching_fingerprint_and_files(tmp_path):
+    output = tmp_path / "output.txt"
+    output.write_text("ok")
+    manifest = ArtifactManifest(tmp_path)
+    fingerprint = stable_hash({"input": 1})
+    manifest.complete("step", fingerprint, [output])
+    assert ArtifactManifest(tmp_path).valid("step", fingerprint, [output])
+    assert not ArtifactManifest(tmp_path).valid("step", stable_hash({"input": 2}), [output])
+    output.unlink()
+    assert not ArtifactManifest(tmp_path).valid("step", fingerprint, [output])
+
+
+def test_human_review_updates_translation_and_invalidates_rendered_files(monkeypatch, tmp_path):
+    from app.subtitle import read_srt, write_srt
+    settings = get_settings().model_copy(update={"jobs_dir": tmp_path})
+    monkeypatch.setattr("app.jobs.get_settings", lambda: settings)
+    directory = tmp_path / "job-1"
+    directory.mkdir()
+    subtitles = [srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "Bản cũ")]
+    write_srt(directory / "vi.srt", subtitles)
+    (directory / "vi-final.json").write_text('[{"id":1,"text":"Bản cũ"}]')
+    (directory / "vi-dubbed.mp4").write_bytes(b"old")
+    manifest = ArtifactManifest(directory)
+    manifest.complete("translation", "fingerprint", [directory / "vi.srt", directory / "vi-final.json"])
+    manifest.complete("dub", "old", [directory / "vi-dubbed.mp4"])
+    apply_subtitle_review("job-1", {1: "Bản sửa tự nhiên hơn"})
+    assert read_srt(directory / "vi.srt")[0].content == "Bản sửa tự nhiên hơn"
+    assert not (directory / "vi-dubbed.mp4").exists()
+    assert "dub" not in ArtifactManifest(directory).data["artifacts"]
 
 
 def test_word_grouping_does_not_split_on_noisy_character_speakers():

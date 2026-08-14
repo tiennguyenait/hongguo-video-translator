@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 from collections.abc import Callable
 
 import requests
@@ -9,6 +10,7 @@ import srt
 
 from .config import get_settings
 from .subtitle import parse_translation_json
+from .artifacts import atomic_write_json
 
 SYSTEM_PROMPT = """You are a senior Vietnamese subtitle localizer for Chinese short dramas.
 Translate dialogue into natural Vietnamese.
@@ -29,6 +31,7 @@ Rules:
 - The Vietnamese line must be comfortably speakable within target_duration_seconds without rushing.
 - Punctuate Vietnamese by meaning so TTS pauses naturally. Use commas only for short internal pauses and periods/questions/exclamations for complete thoughts.
 - Do not add ellipses merely because a sentence crosses cue boundaries; make the full sequence read continuously and naturally.
+- ASR may split one phrase across adjacent ids. Distribute the Vietnamese phrase across those ids as natural continuations; never repeat the final word in a short fragment id.
 - Keep emotional tension and relationship nuance.
 - Use pronouns naturally: anh/em, tôi/cô, mẹ/con, sếp/tôi depending on context.
 - Keep subtitles concise and easy to read.
@@ -39,6 +42,16 @@ SHORTEN_SYSTEM_PROMPT = """You are a Vietnamese dialogue editor.
 Rewrite each Vietnamese line into natural, conversational short-drama dialogue.
 Keep the same intent, emotion, names and important facts, but remove redundant wording.
 Never exceed max_words. Return valid JSON only with exactly the same ids and text fields."""
+SCENE_EDITOR_PROMPT = """You are the final dialogue editor for a Vietnamese short drama.
+Edit the supplied Vietnamese scene as one coherent conversation.
+Rules:
+- Return valid JSON only, with exactly the same ids and text fields.
+- Preserve plot facts, names, numbers, intent and emotional progression.
+- Make adjacent lines flow naturally; remove accidental repetition caused by ASR.
+- Keep character address and pronouns consistent with speaker and context.
+- Prefer idiomatic spoken Vietnamese over literal Chinese syntax.
+- When one source sentence crosses adjacent ids, distribute it as a continuous Vietnamese sentence. Never turn a one-character ASR tail into a repeated standalone word.
+- Do not exceed each item's max_words. Do not add explanations."""
 
 
 def _required(name: str) -> str:
@@ -98,10 +111,17 @@ def _gemini(system: str, user: str) -> str:
 def translate_subtitles(
     subtitles: list[srt.Subtitle], provider: str, source_language: str, target_language: str,
     glossary: str | None = None, progress: Callable[[str], None] | None = None,
-    speakers: dict[int, str] | None = None,
+    speakers: dict[int, str] | None = None, job_dir: Path | None = None,
 ) -> list[srt.Subtitle]:
     settings = get_settings()
     translated: list[srt.Subtitle] = []
+    draft_path = job_dir / "vi-draft.json" if job_dir else None
+    draft_mapping: dict[int, str] = {}
+    if draft_path and draft_path.is_file():
+        try:
+            draft_mapping = {int(item["id"]): str(item["text"]) for item in json.loads(draft_path.read_text(encoding="utf-8"))}
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            draft_mapping = {}
     for offset in range(0, len(subtitles), settings.translation_batch_size):
         batch = subtitles[offset : offset + settings.translation_batch_size]
         items = [
@@ -117,7 +137,22 @@ def translate_subtitles(
             for cue in batch
         ]
         expected_ids = [cue.index for cue in batch]
+        if all(cue.index in draft_mapping for cue in batch):
+            mapping = {cue.index: draft_mapping[cue.index] for cue in batch}
+            translated.extend(srt.Subtitle(index=cue.index, start=cue.start, end=cue.end, content=mapping[cue.index]) for cue in batch)
+            if progress:
+                progress(f"Resumed translation {min(offset + len(batch), len(subtitles))}/{len(subtitles)} cues")
+            continue
+        context_start = max(0, offset - settings.translation_context_before)
+        context_end = min(len(subtitles), offset + len(batch) + settings.translation_context_after)
+        context = [
+            {"id": cue.index, "speaker": (speakers or {}).get(cue.index), "text": cue.content,
+             "translate": cue in batch}
+            for cue in subtitles[context_start:context_end]
+        ]
         prompt = _user_prompt(items, source_language, target_language, glossary)
+        prompt += "\n\nContext before/after (for understanding only; translate=false ids must not be returned):\n"
+        prompt += json.dumps(context, ensure_ascii=False)
         last_error: Exception | None = None
         for attempt in range(1, settings.translation_retries + 1):
             try:
@@ -160,7 +195,65 @@ def translate_subtitles(
                 time.sleep(attempt * 2)
         else:
             raise RuntimeError(str(last_error))
+        draft_mapping.update(mapping)
+        if draft_path:
+            atomic_write_json(draft_path, [{"id": cue.index, "text": draft_mapping[cue.index]} for cue in subtitles if cue.index in draft_mapping])
         translated.extend(srt.Subtitle(index=cue.index, start=cue.start, end=cue.end, content=mapping[cue.index]) for cue in batch)
         if progress:
             progress(f"Translated {min(offset + len(batch), len(subtitles))}/{len(subtitles)} subtitle cues")
-    return translated
+    if not settings.translation_scene_review or len(translated) < 2:
+        if job_dir:
+            atomic_write_json(job_dir / "vi-final.json", [{"id": cue.index, "text": cue.content} for cue in translated])
+        return translated
+
+    # Review coherent chunks with overlap-free boundaries. This second pass fixes
+    # pronouns and continuity after all draft lines are available.
+    final_mapping = {cue.index: cue.content for cue in translated}
+    speaker_memory: dict[str, list[str]] = {}
+    review_size = 30
+    for offset in range(0, len(translated), review_size):
+        scene = translated[offset : offset + review_size]
+        review_items = [
+            {
+                "id": cue.index, "speaker": (speakers or {}).get(cue.index), "text": cue.content,
+                "max_words": max(2, min(28, round((cue.end - cue.start).total_seconds() * 3.5))),
+            }
+            for cue in scene
+        ]
+        previous = translated[max(0, offset - 5):offset]
+        user = "Edit this scene:\n" + json.dumps(review_items, ensure_ascii=False)
+        if previous:
+            user += "\nPrevious dialogue for context only:\n" + json.dumps(
+                [{"id": cue.index, "text": final_mapping[cue.index]} for cue in previous], ensure_ascii=False
+            )
+        if speaker_memory:
+            user += "\nEstablished character voice/pronoun examples (context only):\n" + json.dumps(speaker_memory, ensure_ascii=False)
+        last_error: Exception | None = None
+        for attempt in range(1, settings.translation_retries + 1):
+            try:
+                raw = _gemini(SCENE_EDITOR_PROMPT, user) if provider == "gemini" else _openai_compatible(provider, SCENE_EDITOR_PROMPT, user)
+                reviewed = parse_translation_json(raw, [cue.index for cue in scene])
+                limits = {item["id"]: item["max_words"] for item in review_items}
+                too_long = [item_id for item_id, text in reviewed.items() if len(text.split()) > limits[item_id] + 2]
+                if too_long:
+                    raise ValueError(f"Scene editor exceeded word budget for ids: {too_long}")
+                final_mapping.update(reviewed)
+                for cue in scene:
+                    speaker = (speakers or {}).get(cue.index)
+                    if speaker:
+                        examples = speaker_memory.setdefault(speaker, [])
+                        examples.append(reviewed[cue.index])
+                        del examples[:-6]
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < settings.translation_retries:
+                    time.sleep(attempt * 2)
+        if last_error and any(cue.index not in final_mapping for cue in scene):
+            raise RuntimeError(f"Scene editing failed: {last_error}")
+        if progress:
+            progress(f"Context-edited {min(offset + len(scene), len(translated))}/{len(translated)} cues")
+    final = [srt.Subtitle(index=cue.index, start=cue.start, end=cue.end, content=final_mapping[cue.index]) for cue in translated]
+    if job_dir:
+        atomic_write_json(job_dir / "vi-final.json", [{"id": cue.index, "text": cue.content} for cue in final])
+    return final

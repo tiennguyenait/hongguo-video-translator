@@ -6,9 +6,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from .database import delete_job, get_job, init_db, list_jobs, recover_interrupted_jobs
-from .jobs import remove_job_files, safe_job_file, serialize_job, worker
+from .jobs import apply_subtitle_review, job_directory, remove_job_files, safe_job_file, serialize_job, worker
 from .models import JobStatus
-from .schemas import JobCreate, JobResponse
+from .schemas import JobCreate, JobResponse, JobReview
+from .subtitle import read_srt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -22,7 +23,7 @@ async def lifespan(_: FastAPI):
     worker.stop()
 
 
-app = FastAPI(title="Hongguo Video Translator", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Hongguo Video Translator", version="2.0.0", lifespan=lifespan)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
@@ -65,6 +66,36 @@ def job_detail(job_id: str):
     if not row:
         raise HTTPException(404, "Job not found")
     return serialize_job(row)
+
+
+@app.get("/api/jobs/{job_id}/subtitles")
+def job_subtitles(job_id: str):
+    if not get_job(job_id):
+        raise HTTPException(404, "Job not found")
+    source_path, translated_path = job_directory(job_id) / "source.srt", job_directory(job_id) / "vi.srt"
+    if not source_path.is_file() or not translated_path.is_file():
+        raise HTTPException(404, "Subtitles are not ready")
+    source = {cue.index: cue for cue in read_srt(source_path)}
+    translated = {cue.index: cue for cue in read_srt(translated_path)}
+    return [{
+        "id": item_id, "start": str(source[item_id].start), "end": str(source[item_id].end),
+        "source": source[item_id].content, "translation": translated.get(item_id).content if item_id in translated else "",
+    } for item_id in source]
+
+
+@app.patch("/api/jobs/{job_id}/subtitles", status_code=202)
+def review_subtitles(job_id: str, request: JobReview):
+    row = get_job(job_id)
+    if not row:
+        raise HTTPException(404, "Job not found")
+    if row["status"] not in {JobStatus.DONE, JobStatus.NEEDS_REVIEW} or worker.is_active(job_id):
+        raise HTTPException(409, "Job must be finished before subtitles can be edited")
+    try:
+        apply_subtitle_review(job_id, {item.id: item.text for item in request.translations})
+        worker.retry(job_id, "Human edits saved; rendering affected outputs from checkpoint")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"id": job_id, "status": "queued"}
 
 
 @app.get("/api/jobs/{job_id}/files/{filename}")

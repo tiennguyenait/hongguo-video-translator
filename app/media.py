@@ -70,18 +70,24 @@ def mux_delayed_clips(
         filters.append(f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:normalize=0[dubmix]")
     filters.append(
         f"[dubmix]apad=whole_dur={duration:.6f},atrim=0:{duration:.6f},"
-        "aresample=48000:async=1:first_pts=0[dub]"
+        "aresample=48000:async=1:first_pts=0,highpass=f=65,lowpass=f=12000,"
+        "dynaudnorm=f=250:g=7:p=0.9[dub]"
     )
     output_label = "dub"
     if original_audio_volume > 0:
+        filters.append("[dub]asplit=2[dub_sc][dub_mix]")
+        filters.append(f"[0:a]aresample=48000:async=1:first_pts=0,volume={original_audio_volume}[original]")
+        # Duck the source only while Vietnamese speech is active. This preserves
+        # music/effects between lines and avoids a permanently muffled soundtrack.
+        filters.append("[original][dub_sc]sidechaincompress=threshold=0.025:ratio=8:attack=18:release=280:makeup=1[ducked]")
         filters.append(
-            f"[0:a]aresample=48000:async=1:first_pts=0,volume={original_audio_volume}[original]"
-        )
-        filters.append(
-            f"[original][dub]amix=inputs=2:duration=longest:normalize=0,"
-            f"atrim=0:{duration:.6f}[mixed]"
+            f"[ducked][dub_mix]amix=inputs=2:duration=longest:normalize=0,atrim=0:{duration:.6f},"
+            "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,alimiter=limit=0.94[mixed]"
         )
         output_label = "mixed"
+    else:
+        filters.append("[dub]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,alimiter=limit=0.94[master]")
+        output_label = "master"
     script = output.parent / "dub-filter.ffscript"
     script.write_text(";\n".join(filters), encoding="utf-8")
     command += [

@@ -1,6 +1,8 @@
 # Hongguo Video Translator
 
-FastAPI server tải video Hongguo/direct MP4/M3U8, nhận dạng và forced-align lời thoại bằng WhisperX, tùy chọn speaker diarization bằng pyannote, dịch sang tiếng Việt, burn subtitle và tạo bản thuyết minh VieNeu-TTS chạy local. Metadata được lưu trong SQLite; một worker thread xử lý đúng một job tại một thời điểm để bảo vệ GPU.
+FastAPI server tải video Hongguo/direct MP4/M3U8, nhận dạng và forced-align lời thoại bằng WhisperX, tùy chọn speaker diarization bằng pyannote, dịch hai lượt có ngữ cảnh sang tiếng Việt, burn subtitle và tạo bản thuyết minh VieNeu-TTS chạy local. Metadata được lưu trong SQLite; một worker thread xử lý đúng một job tại một thời điểm để bảo vệ GPU.
+
+Pipeline 2.0 có checkpoint nguyên tử, cache TTS theo fingerprint, semantic dialogue units, sửa fragment diarization, text normalization riêng cho cách đọc, speech timing plan, FFmpeg sidechain ducking/loudness và QA tự động. Job bị gián đoạn tiếp tục từ artifact hợp lệ gần nhất.
 
 ## Cài đặt trên Vast.ai Ubuntu
 
@@ -54,15 +56,19 @@ curl -X POST http://127.0.0.1:8000/api/jobs \
 - `GET /api/jobs` — job gần đây
 - `GET /api/jobs/{id}` — trạng thái và output hiện có
 - `GET /api/jobs/{id}/files/{filename}` — tải output được phép
+- `GET /api/jobs/{id}/subtitles` — lấy source/translation để review
+- `PATCH /api/jobs/{id}/subtitles` — lưu câu sửa và render lại từ checkpoint
 - `DELETE /api/jobs/{id}` — xóa job đã done/failed và toàn bộ file
 
 Job đang queued/running không thể bị xóa. Khi server restart, job đang chạy được đưa lại vào hàng đợi. Đường dẫn tải chỉ chấp nhận tên output định trước và không cho traversal.
 
 ## Output
 
-Mỗi job nằm trong `data/jobs/{uuid}/`: `source.mp4`, `source.srt`, `vi.srt`, tùy chọn `vi-burned.mp4`, các WAV TTS riêng lẻ và `vi-dubbed.mp4`. SQLite ở `data/jobs.sqlite3`. FFmpeg đặt từng WAV vào timeline bằng `adelay`/`amix` và mux thẳng ra MP4; không tạo WAV timeline khổng lồ trong RAM.
+Mỗi job nằm trong `data/jobs/{uuid}/`: `source.mp4`, `source.srt`, `vi-draft.json`, `vi-final.json`, `vi.srt`, `dialogue-units.json`, `speech-plan.json`, `tts-timing.json`, `artifacts.json`, `qa-report.json`, tùy chọn `vi-burned.mp4`, các WAV TTS riêng lẻ và `vi-dubbed.mp4`. SQLite ở `data/jobs.sqlite3`. FFmpeg đặt từng WAV vào timeline bằng `adelay`/`amix` và mux thẳng ra MP4; không tạo WAV timeline khổng lồ trong RAM.
 
-Chế độ thuyết minh dùng một giọng VieNeu-TTS v3 Turbo local với style kể chuyện. Các cue cùng lượt nói được ghép thành câu tự nhiên và đặt lại đúng timeline. `original_audio_volume=0` thay audio gốc; giá trị `0..1` trộn audio gốc nhỏ bên dưới.
+Chế độ thuyết minh dùng một giọng VieNeu-TTS v3 Turbo local với style kể chuyện. Các cue cùng lượt nói được ghép thành câu tự nhiên và đặt lại đúng timeline. `subtitle_text` được giữ nguyên để hiển thị, còn `spoken_text` chuẩn hóa số/đơn vị cho TTS. `original_audio_volume=0` thay audio gốc; giá trị `0..1` giữ nhạc/hiệu ứng và tự động duck audio gốc khi giọng Việt xuất hiện.
+
+UI cho phép sửa từng câu sau khi job hoàn tất. Khi lưu, server giữ nguyên download/ASR/translation checkpoint, chỉ tạo lại subtitle burn, những clip TTS bị thay đổi, mix và QA.
 
 ## Kiểm tra
 
@@ -71,4 +77,13 @@ source .venv/bin/activate
 pytest -q
 python -m compileall app
 python -c 'from app.main import app; print(app.title)'
+```
+
+E2E release cần kiểm tra thêm:
+
+```bash
+ffmpeg -v error -i data/jobs/JOB_ID/vi-dubbed.mp4 -f null -
+ffprobe -v error -show_entries format=duration:stream=codec_type,codec_name,sample_rate \
+  -of json data/jobs/JOB_ID/vi-dubbed.mp4
+jq . data/jobs/JOB_ID/qa-report.json
 ```

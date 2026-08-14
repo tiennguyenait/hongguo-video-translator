@@ -40,6 +40,7 @@ class JobOutputs(BaseModel):
     burned_video: str | None = None
     dubbed_video: str | None = None
     speaker_report: str | None = None
+    qa_report: str | None = None
 
 
 class JobResponse(BaseModel):
@@ -57,3 +58,12 @@ class JobResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     outputs: JobOutputs
+
+
+class SubtitleEdit(BaseModel):
+    id: int = Field(ge=1)
+    text: str = Field(min_length=1, max_length=1000)
+
+
+class JobReview(BaseModel):
+    translations: list[SubtitleEdit] = Field(min_length=1, max_length=5000)
