@@ -97,7 +97,8 @@ def create_folder_upload(
     options: str = Form("{}"),
     logo: UploadFile | None = File(default=None),
 ):
-    if not videos or len(videos) > 200:
+    mp4_videos = [item for item in videos if Path(item.filename or "").suffix.lower() == ".mp4"]
+    if not mp4_videos or len(mp4_videos) > 200:
         raise HTTPException(400, "Select between 1 and 200 MP4 files")
     batch = None
     try:
@@ -114,9 +115,7 @@ def create_folder_upload(
         if bool(channel_name) != bool(logo and logo.filename):
             raise ValueError("Provide both channel name and channel logo, or leave both empty")
         request = JobCreate(url="https://upload.local/source.mp4", **payload)
-        ordered = sorted(videos, key=lambda item: batching.natural_filename_key(item.filename or ""))
-        if any(Path(item.filename or "").suffix.lower() != ".mp4" for item in ordered):
-            raise ValueError("Folder may contain MP4 files only")
+        ordered = sorted(mp4_videos, key=lambda item: batching.natural_filename_key(item.filename or ""))
         batch = batching.create_folder_batch(
             request.burn_subtitles, request.dub, channel_name, watermark_opacity,
         )

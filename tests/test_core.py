@@ -54,6 +54,7 @@ def test_single_upload_ui_uses_branded_batch_pipeline():
     assert "mode==='folder'||mode==='upload'" in html
     assert "endpoint='/api/batches/upload'" in html
     assert "data.append('logo',logo,logo.name)" in html
+    assert "selected.filter(file=>file.name.toLowerCase().endsWith('.mp4'))" in html
 
 
 def test_folder_episode_names_use_natural_numeric_order():
