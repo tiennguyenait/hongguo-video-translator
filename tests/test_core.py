@@ -184,6 +184,16 @@ def test_adaptive_subtitle_fits_text_and_uses_same_mask_region(tmp_path):
     assert report[0]["background"]["width"] <= 900
 
 
+def test_adaptive_subtitle_normalizes_vietnamese_and_uses_static_font(tmp_path):
+    decomposed = "ye\u0302u em"
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=1), decomposed)
+    region = SubtitleRegion(100, 600, 900, 80, 0.9, 0, 2)
+    generate_adaptive_ass([cue], [region], 1280, 720, tmp_path / "vi.ass")
+    content = (tmp_path / "vi.ass").read_text(encoding="utf-8")
+    assert "yêu em" in content
+    assert r"\b600" not in content
+
+
 def test_word_grouping_does_not_split_on_noisy_character_speakers():
     words = [
         {"word": "马", "start": 0.0, "end": 0.2, "speaker": "A"},

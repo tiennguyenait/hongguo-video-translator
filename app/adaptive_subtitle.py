@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,10 +12,10 @@ from PIL import ImageFont
 
 from .source_subtitle_mask import SubtitleRegion
 
-UBUNTU_FONT_PATH = Path("/usr/share/fonts/truetype/ubuntu/UbuntuSans[wdth,wght].ttf")
+PROJECT_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "BeVietnamPro-SemiBold.ttf"
 FALLBACK_FONT_PATH = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-FONT_PATH = UBUNTU_FONT_PATH if UBUNTU_FONT_PATH.is_file() else FALLBACK_FONT_PATH
-FONT_NAME = "Ubuntu Sans" if FONT_PATH == UBUNTU_FONT_PATH else "DejaVu Sans"
+FONT_PATH = PROJECT_FONT_PATH if PROJECT_FONT_PATH.is_file() else FALLBACK_FONT_PATH
+FONT_NAME = "Be Vietnam Pro SemiBold" if FONT_PATH == PROJECT_FONT_PATH else "DejaVu Sans"
 
 
 @dataclass(slots=True)
@@ -29,13 +30,7 @@ def _text_width(text: str, font: ImageFont.FreeTypeFont) -> float:
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont:
-    font = ImageFont.truetype(str(FONT_PATH), size)
-    if FONT_PATH == UBUNTU_FONT_PATH:
-        try:
-            font.set_variation_by_name("SemiBold")
-        except OSError:
-            pass
-    return font
+    return ImageFont.truetype(str(FONT_PATH), size)
 
 
 def fit_text(text: str, width: int, height: int, max_font_size: int) -> FittedText:
@@ -113,12 +108,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     report: list[dict] = []
     previous_size: int | None = None
     for cue in subtitles:
+        normalized_text = unicodedata.normalize("NFC", cue.content.strip())
         midpoint = (cue.start.total_seconds() + cue.end.total_seconds()) / 2
         matching = [region for region in regions if region.start <= midpoint <= region.end]
         region = matching[0] if matching else min(regions, key=lambda item: min(abs(midpoint - item.start), abs(midpoint - item.end)))
-        available_width = round(region.width * 0.90)
+        available_width = round(region.width * 0.96)
         available_height = round(region.height * 0.82)
-        fitted = fit_text(cue.content.strip(), available_width, available_height, max_font_size=round(video_height * 0.047))
+        fitted = fit_text(normalized_text, available_width, available_height, max_font_size=round(video_height * 0.047))
         # Quantized sizes avoid distracting frame-to-frame pumping. Adjacent cues
         # may shrink for long lines but never jump upward by more than one level.
         if previous_size is not None and fitted.font_size > previous_size + 2:
@@ -140,10 +136,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             rf"{{\an7\pos(0,0)\p1\1c&H000000&\bord0\shad0}}{path}"
         )
         text = r"\N".join(_escape_ass(line) for line in fitted.lines)
-        override = rf"{{\an5\pos({x},{y})\fs{fitted.font_size}\b600}}"
+        override = rf"{{\an5\pos({x},{y})\fs{fitted.font_size}}}"
         text_events.append(f"Dialogue: 1,{_ass_time(cue.start.total_seconds())},{_ass_time(cue.end.total_seconds())},Adaptive,,0,0,0,,{override}{text}")
         report.append({
-            "id": cue.index, "font_size": fitted.font_size, "lines": fitted.lines, "x": x, "y": y,
+            "id": cue.index, "font": FONT_NAME, "font_size": fitted.font_size, "lines": fitted.lines, "x": x, "y": y,
             "background": {"x": background_x, "y": background_y, "width": background_width, "height": background_height, "radius": radius},
             "region": {"x": region.x, "y": region.y, "width": region.width, "height": region.height},
         })

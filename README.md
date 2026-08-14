@@ -68,7 +68,7 @@ Mỗi job nằm trong `data/jobs/{uuid}/`: `source.mp4`, `source.srt`, `vi-draft
 
 `hide_source_subtitles=true` (mặc định) lấy mẫu frame theo timestamp ASR, phát hiện vùng chữ bằng OpenCV, dùng temporal consensus để chọn một vùng ổn định và phủ tối đúng các khoảng có thoại trước khi burn chữ Việt. Kết quả được cache trong `subtitle-regions.json`; confidence thấp được ghi warning trong QA.
 
-Khi có vùng che, server sinh `vi.ass` thay vì đặt thêm nền riêng cho SRT. Mỗi cue dùng một nền vector đen bo tròn theo độ dài câu, có độ rộng tối thiểu để phủ chữ nguồn. Chữ Việt dùng Ubuntu Sans SemiBold (fallback DejaVu Sans), được căn giữa và tự chọn cỡ chữ/chia tối đa hai dòng theo metric font thật. Trên video 720p cỡ chữ chủ yếu 32–34 px và chỉ thay đổi theo bước 2 px; quyết định layout/radius lưu trong `subtitle-layout.json`.
+Khi có vùng che, server sinh `vi.ass` thay vì đặt thêm nền riêng cho SRT. Mỗi cue dùng một nền vector đen bo tròn theo độ dài câu, có độ rộng tối thiểu để phủ chữ nguồn. Chữ Việt dùng file TTF tĩnh `Be Vietnam Pro SemiBold` được đóng gói trong `app/fonts/` theo giấy phép SIL OFL; text được chuẩn hóa NFC và FFmpeg được trỏ vào đúng `fontsdir` để không fallback glyph/dấu tiếng Việt sang font khác. Trên video 720p cỡ chữ chủ yếu 32–34 px và chỉ thay đổi theo bước 2 px; quyết định layout/radius lưu trong `subtitle-layout.json`.
 
 Chế độ thuyết minh dùng một giọng VieNeu-TTS v3 Turbo local với style kể chuyện. Các cue cùng lượt nói được ghép thành câu tự nhiên và đặt lại đúng timeline. `subtitle_text` được giữ nguyên để hiển thị, còn `spoken_text` chuẩn hóa số/đơn vị cho TTS. `original_audio_volume=0` thay audio gốc; giá trị `0..1` giữ nhạc/hiệu ứng và tự động duck audio gốc khi giọng Việt xuất hiện.
 

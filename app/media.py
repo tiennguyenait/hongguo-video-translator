@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import srt
 
-from .adaptive_subtitle import generate_adaptive_ass
+from .adaptive_subtitle import FONT_PATH, generate_adaptive_ass
 
 if TYPE_CHECKING:
     from .source_subtitle_mask import SubtitleRegion
@@ -38,7 +38,7 @@ def probe_video_size(path: Path) -> tuple[int, int]:
     return int(width), int(height)
 
 
-def _subtitle_filter(path: Path, force_style: bool = True) -> str:
+def _subtitle_filter(path: Path, force_style: bool = True, fonts_dir: Path | None = None) -> str:
     escaped = str(path.resolve()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''").replace(",", "\\,")
     style = (
         "FontName=Arial,FontSize=11,PrimaryColour=&H00FFFFFF,"
@@ -46,6 +46,9 @@ def _subtitle_filter(path: Path, force_style: bool = True) -> str:
         "BorderStyle=3,Outline=1,Shadow=0,Alignment=2,MarginV=28"
     )
     suffix = f":force_style='{style}'" if force_style else ""
+    if fonts_dir:
+        escaped_fonts = str(fonts_dir.resolve()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''").replace(",", "\\,")
+        suffix += f":fontsdir='{escaped_fonts}'"
     return f"subtitles=filename='{escaped}'{suffix}"
 
 
@@ -58,7 +61,7 @@ def burn_subtitles(video: Path, subtitle: Path, output: Path, regions: list["Sub
             list(srt.parse(subtitle.read_text(encoding="utf-8-sig"))), regions, width, height,
             ass_path, output.parent / "subtitle-layout.json",
         )
-        filters.append(_subtitle_filter(ass_path, force_style=False))
+        filters.append(_subtitle_filter(ass_path, force_style=False, fonts_dir=FONT_PATH.parent))
     else:
         filters.append(_subtitle_filter(subtitle))
     run_ffmpeg(["ffmpeg", "-y", "-i", str(video), "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "copy", "-movflags", "+faststart", str(output)])
