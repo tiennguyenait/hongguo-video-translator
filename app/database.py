@@ -75,6 +75,10 @@ def init_db() -> None:
             db.execute("ALTER TABLE batches ADD COLUMN channel_name TEXT NOT NULL DEFAULT ''")
         if "watermark_opacity" not in batch_columns:
             db.execute("ALTER TABLE batches ADD COLUMN watermark_opacity REAL NOT NULL DEFAULT 0.58")
+        if "output_filename" not in batch_columns:
+            db.execute("ALTER TABLE batches ADD COLUMN output_filename TEXT NOT NULL DEFAULT ''")
+        if "expected_episodes" not in batch_columns:
+            db.execute("ALTER TABLE batches ADD COLUMN expected_episodes INTEGER NOT NULL DEFAULT 0")
 
 
 def create_job(values: dict[str, Any]) -> dict[str, Any]:

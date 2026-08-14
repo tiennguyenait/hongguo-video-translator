@@ -51,8 +51,9 @@ def test_default_job_keeps_source_subtitles_and_enables_vietnamese_dub():
 def test_single_upload_ui_uses_branded_batch_pipeline():
     html = (Path(__file__).parents[1] / "app" / "static" / "index.html").read_text(encoding="utf-8")
     assert 'id="brandingOptions"' in html
-    assert "mode==='folder'||mode==='upload'" in html
-    assert "endpoint='/api/batches/upload'" in html
+    assert "'/api/batches/upload'" in html
+    assert "'/api/batches/start'" in html
+    assert "offset+=15" in html
     assert "data.append('logo',logo,logo.name)" in html
     assert "selected.filter(file=>file.name.toLowerCase().endsWith('.mp4'))" in html
 
@@ -63,6 +64,7 @@ def test_folder_episode_names_use_natural_numeric_order():
 
 
 def test_concat_videos_normalizes_different_episode_sizes(tmp_path):
+    from PIL import Image
     episodes = []
     for index, size in enumerate(("160x90", "120x90"), 1):
         path = tmp_path / f"episode-{index}.mp4"
@@ -73,9 +75,14 @@ def test_concat_videos_normalizes_different_episode_sizes(tmp_path):
         ], check=True)
         episodes.append(path)
     output = tmp_path / "combined.mp4"
-    concat_videos(episodes, output)
+    logo = tmp_path / "logo.png"
+    Image.new("RGBA", (64, 64), (230, 40, 70, 255)).save(logo)
+    concat_videos(episodes, output, logo, "KÊNH TEST", 0.58)
     assert probe_video_size(output) == (160, 90)
     assert 0.7 < probe_duration(output) < 1.0
+    script = (tmp_path / "concat-filter.ffscript").read_text(encoding="utf-8")
+    assert "drawtext=" in script
+    assert script.count("concat=n=2") == 1
 
 
 def test_channel_watermark_renders_and_preserves_timing(tmp_path):

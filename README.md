@@ -73,6 +73,10 @@ curl -X POST http://127.0.0.1:8000/api/batches/upload \
 
 Tên file được natural-sort (`tap-2` đứng trước `tap-10`), tối đa 200 MP4. Logo tối đa 5 MiB; nên dùng PNG vuông có nền trong suốt. Logo và chữ nằm ở góc trên trái, cùng opacity mặc định `0.58`. Phải gửi cả `channel_name` và `logo`, hoặc bỏ trống cả hai.
 
+UI upload folder theo các request 15 tập. Nhóm đã nhận được giữ nguyên nếu nhóm sau mất mạng; mỗi nhóm tự retry tối đa ba lần. Job của nhóm đầu có thể xử lý trong lúc trình duyệt tiếp tục upload nhóm sau. Ba endpoint phục vụ luồng resumable này là `POST /api/batches/start`, `POST /api/batches/{id}/chunks` và `POST /api/batches/{id}/finish`.
+
+Khi hoàn tất, FFmpeg natural-concat theo thứ tự tập và gắn logo/tên kênh trong cùng một filter graph. Video chỉ encode một lần; FPS đích lấy theo FPS phổ biến nhất trong batch thay vì luôn ép 30 FPS. Nếu mọi stream giống nhau và không có watermark, server dùng concat demuxer với stream copy.
+
 - `GET /api/jobs` — job gần đây
 - `GET /api/jobs/{id}` — trạng thái và output hiện có
 - `GET /api/jobs/{id}/files/{filename}` — tải output được phép

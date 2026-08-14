@@ -1,5 +1,6 @@
 import json
 import subprocess
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -60,21 +61,52 @@ def _stream_signature(path: Path) -> tuple:
     )
 
 
-def concat_videos(inputs: list[Path], output: Path) -> None:
-    """Losslessly concatenate matching episodes; normalize only when formats differ."""
+def _watermark_filter_lines(base: str, logo_index: int, width: int, height: int, channel_name: str, opacity: float) -> list[str]:
+    logo_size = max(32, round(height * 0.055))
+    margin_x, margin_y = max(10, round(width * 0.012)), max(10, round(height * 0.018))
+    gap, font_size = max(8, round(width * 0.007)), max(17, round(height * 0.025))
+    opacity = min(0.85, max(0.15, float(opacity)))
+    text = channel_name.replace("\\", "\\\\").replace("'", "'\\''").replace(":", "\\:")
+    font = str(FONT_PATH.resolve()).replace("\\", "\\\\").replace("'", "'\\''").replace(":", "\\:")
+    return [
+        f"[{logo_index}:v]format=rgba,colorchannelmixer=aa={opacity:.3f},scale={logo_size}:{logo_size}:force_original_aspect_ratio=decrease,pad={logo_size}:{logo_size}:(ow-iw)/2:(oh-ih)/2:color=black@0[wm]",
+        f"[{base}][wm]overlay={margin_x}:{margin_y}:format=auto[branded]",
+        f"[branded]drawtext=fontfile='{font}':text='{text}':expansion=none:fontcolor=white@{opacity:.3f}:fontsize={font_size}:x={margin_x + logo_size + gap}:y={margin_y}+({logo_size}-text_h)/2:shadowcolor=black@0.30:shadowx=1:shadowy=1[outv]",
+    ]
+
+
+def concat_videos(
+    inputs: list[Path], output: Path, logo: Path | None = None,
+    channel_name: str = "", opacity: float = 0.58,
+) -> None:
+    """Concatenate episodes and, when requested, brand in the same encode pass."""
     if not inputs:
         raise ValueError("At least one episode is required")
     signatures = [_stream_signature(path) for path in inputs]
-    if all(signature == signatures[0] for signature in signatures[1:]):
+    branded_duration = sum(probe_duration(path) for path in inputs) if logo and channel_name else None
+    matching = all(signature == signatures[0] for signature in signatures[1:])
+    if matching:
         manifest = output.parent / "concat-files.txt"
         lines = ["file '" + str(path.resolve()).replace("'", "'\\''") + "'\n" for path in inputs]
         manifest.write_text("".join(lines), encoding="utf-8")
+        if not logo or not channel_name:
+            run_ffmpeg([
+                "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(manifest),
+                "-c", "copy", "-movflags", "+faststart", str(output),
+            ])
+            return
+        width, height = int(signatures[0][1]), int(signatures[0][2])
+        script = output.parent / "concat-filter.ffscript"
+        script.write_text(";\n".join(_watermark_filter_lines("0:v", 1, width, height, channel_name, opacity)), encoding="utf-8")
         run_ffmpeg([
             "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(manifest),
-            "-c", "copy", "-movflags", "+faststart", str(output),
+            "-loop", "1", "-i", str(logo), "-filter_complex_script", str(script),
+            "-map", "[outv]", "-map", "0:a:0", "-c:v", "libx264", "-preset", "medium", "-crf", VIDEO_CRF,
+            "-c:a", "copy", "-t", f"{branded_duration:.6f}", "-movflags", "+faststart", str(output),
         ])
         return
     width, height = int(signatures[0][1]), int(signatures[0][2])
+    target_fps = Counter(str(signature[3]) for signature in signatures).most_common(1)[0][0]
     command = ["ffmpeg", "-y", "-v", "error"]
     for path in inputs:
         command += ["-i", str(path)]
@@ -82,18 +114,26 @@ def concat_videos(inputs: list[Path], output: Path) -> None:
     for index in range(len(inputs)):
         filters.append(
             f"[{index}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1,format=yuv420p[v{index}]"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={target_fps},setsar=1,format=yuv420p[v{index}]"
         )
         filters.append(f"[{index}:a]aresample=48000,aformat=channel_layouts=stereo[a{index}]")
         labels.append(f"[v{index}][a{index}]")
-    filters.append(f"{''.join(labels)}concat=n={len(inputs)}:v=1:a=1[outv][outa]")
+    filters.append(f"{''.join(labels)}concat=n={len(inputs)}:v=1:a=1[joined][outa]")
+    if logo and channel_name:
+        command += ["-loop", "1", "-i", str(logo)]
+        filters.extend(_watermark_filter_lines("joined", len(inputs), width, height, channel_name, opacity))
+    else:
+        filters.append("[joined]null[outv]")
     script = output.parent / "concat-filter.ffscript"
     script.write_text(";\n".join(filters), encoding="utf-8")
     command += [
         "-filter_complex_script", str(script), "-map", "[outv]", "-map", "[outa]",
         "-c:v", "libx264", "-preset", "medium", "-crf", VIDEO_CRF,
-        "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-movflags", "+faststart", str(output),
+        "-c:a", "aac", "-b:a", AUDIO_BITRATE,
     ]
+    if branded_duration is not None:
+        command += ["-t", f"{branded_duration:.6f}"]
+    command += ["-movflags", "+faststart", str(output)]
     run_ffmpeg(command)
 
 

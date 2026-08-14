@@ -48,5 +48,36 @@ document.querySelectorAll('input[name="sourceMode"]').forEach(input=>input.addEv
 document.querySelector('#saveReview').addEventListener('click',async()=>{const translations=[...reviewRows.querySelectorAll('textarea')].map(x=>({id:Number(x.dataset.id),text:x.value.trim()}));const r=await fetch(`/api/jobs/${currentJobId}/subtitles`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({translations})});if(!r.ok){alert(await r.text());return}review.hidden=true;button.disabled=true;timer=setInterval(()=>poll(currentJobId),2000);poll(currentJobId)});
 async function poll(id){try{const r=await fetch('/api/jobs/'+id);if(!r.ok)throw new Error(await r.text());render(await r.json())}catch(e){statusBox.textContent='Không thể cập nhật: '+e.message}}
 async function pollBatch(id){try{const r=await fetch('/api/batches/'+id);if(!r.ok)throw new Error(await r.text());renderBatch(await r.json())}catch(e){statusBox.textContent='Không thể cập nhật batch: '+e.message}}
-form.addEventListener('submit',async e=>{e.preventDefault();clearInterval(timer);links.innerHTML='';button.disabled=true;statusBox.hidden=false;const mode=form.sourceMode.value;statusBox.textContent=mode==='folder'?'Đang upload folder...':mode==='upload'?'Đang upload video...':'Đang tạo job...';try{const options={provider:document.querySelector('#provider').value,asr_model:document.querySelector('#model').value,diarize:document.querySelector('#diarize').checked,max_speakers:6,source_language_code:'zh',source_language:'Chinese',target_language:'Vietnamese',burn_subtitles:document.querySelector('#burn').checked,hide_source_subtitles:false,dub:document.querySelector('#dub').checked,narrator_mode:true,tts_voice:document.querySelector('#voice').value,original_audio_volume:Number(document.querySelector('#originalVolume').value)};let endpoint='/api/jobs',request;if(mode==='folder'||mode==='upload'){const selected=mode==='folder'?[...document.querySelector('#videoFolder').files]:[document.querySelector('#videoFile').files[0]].filter(Boolean),files=selected.filter(file=>file.name.toLowerCase().endsWith('.mp4')),skipped=selected.length-files.length,channelName=document.querySelector('#channelName').value.trim(),logo=document.querySelector('#channelLogo').files[0];if(!files.length)throw new Error(mode==='folder'?'Folder không có file MP4':'Hãy chọn file MP4');if(files.length>200)throw new Error('Chỉ hỗ trợ tối đa 200 file MP4 mỗi folder');if(Boolean(channelName)!==Boolean(logo))throw new Error('Hãy nhập cả tên kênh và chọn logo, hoặc để trống cả hai');if(skipped)statusBox.textContent=`Đã bỏ qua ${skipped} file không phải MP4. Đang upload ${files.length} video...`;options.channel_name=channelName;options.watermark_opacity=0.58;const data=new FormData();files.forEach(file=>data.append('videos',file,mode==='folder'?(file.webkitRelativePath||file.name):file.name));if(logo)data.append('logo',logo,logo.name);data.append('options',JSON.stringify(options));endpoint='/api/batches/upload';request={method:'POST',body:data}}else{request={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...options,url:document.querySelector('#url').value})}}const r=await fetch(endpoint,request);const body=await r.json();if(!r.ok)throw new Error(body.detail||JSON.stringify(body));if(mode==='folder'||mode==='upload'){renderBatch(body);timer=setInterval(()=>pollBatch(body.id),2000)}else{render(body);timer=setInterval(()=>poll(body.id),2000)}}catch(e){statusBox.className='status error';statusBox.textContent='Lỗi: '+e.message;button.disabled=false}});
+async function jsonRequest(url,request){const r=await fetch(url,request),body=await r.json();if(!r.ok)throw new Error(body.detail||JSON.stringify(body));return body}
+async function uploadChunk(batchId,data){let error;for(let attempt=1;attempt<=3;attempt++){try{return await jsonRequest(`/api/batches/${batchId}/chunks`,{method:'POST',body:data})}catch(e){error=e;if(attempt<3)await new Promise(resolve=>setTimeout(resolve,attempt*1500))}}throw error}
+form.addEventListener('submit',async e=>{
+  e.preventDefault();clearInterval(timer);links.innerHTML='';button.disabled=true;statusBox.hidden=false;
+  const mode=form.sourceMode.value;statusBox.textContent=mode==='folder'?'Đang chuẩn bị upload theo nhóm 15 tập...':mode==='upload'?'Đang upload video...':'Đang tạo job...';
+  try{
+    const options={provider:document.querySelector('#provider').value,asr_model:document.querySelector('#model').value,diarize:document.querySelector('#diarize').checked,max_speakers:6,source_language_code:'zh',source_language:'Chinese',target_language:'Vietnamese',burn_subtitles:document.querySelector('#burn').checked,hide_source_subtitles:false,dub:document.querySelector('#dub').checked,narrator_mode:true,tts_voice:document.querySelector('#voice').value,original_audio_volume:Number(document.querySelector('#originalVolume').value)};
+    if(mode==='url'){
+      const body=await jsonRequest('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...options,url:document.querySelector('#url').value})});render(body);timer=setInterval(()=>poll(body.id),2000);return;
+    }
+    const selected=mode==='folder'?[...document.querySelector('#videoFolder').files]:[document.querySelector('#videoFile').files[0]].filter(Boolean);
+    const files=selected.filter(file=>file.name.toLowerCase().endsWith('.mp4')).sort((a,b)=>(a.webkitRelativePath||a.name).localeCompare(b.webkitRelativePath||b.name,undefined,{numeric:true,sensitivity:'base'}));
+    const channelName=document.querySelector('#channelName').value.trim(),logo=document.querySelector('#channelLogo').files[0];
+    if(!files.length)throw new Error(mode==='folder'?'Folder không có file MP4':'Hãy chọn file MP4');
+    if(files.length>200)throw new Error('Chỉ hỗ trợ tối đa 200 file MP4 mỗi folder');
+    if(Boolean(channelName)!==Boolean(logo))throw new Error('Hãy nhập cả tên kênh và chọn logo, hoặc để trống cả hai');
+    options.channel_name=channelName;options.watermark_opacity=0.58;
+    if(mode==='upload'){
+      const data=new FormData();data.append('videos',files[0],files[0].name);if(logo)data.append('logo',logo,logo.name);data.append('options',JSON.stringify(options));
+      const body=await jsonRequest('/api/batches/upload',{method:'POST',body:data});renderBatch(body);timer=setInterval(()=>pollBatch(body.id),2000);return;
+    }
+    const setup=new FormData();setup.append('expected_episodes',String(files.length));setup.append('options',JSON.stringify(options));if(logo)setup.append('logo',logo,logo.name);
+    let batch=await jsonRequest('/api/batches/start',{method:'POST',body:setup});currentBatchId=batch.id;
+    for(let offset=0;offset<files.length;offset+=15){
+      const group=files.slice(offset,offset+15),data=new FormData(),positions=group.map((_,index)=>offset+index+1);
+      group.forEach(file=>data.append('videos',file,file.webkitRelativePath||file.name));data.append('positions',JSON.stringify(positions));data.append('options',JSON.stringify(options));
+      statusBox.textContent=`Đang upload nhóm ${Math.floor(offset/15)+1}/${Math.ceil(files.length/15)} — tập ${positions[0]}-${positions.at(-1)}`;
+      batch=await uploadChunk(batch.id,data);
+    }
+    batch=await jsonRequest(`/api/batches/${batch.id}/finish`,{method:'POST'});renderBatch(batch);timer=setInterval(()=>pollBatch(batch.id),2000);
+  }catch(e){statusBox.className='status error';statusBox.textContent='Lỗi: '+e.message;button.disabled=false}
+});
 </script></body></html>

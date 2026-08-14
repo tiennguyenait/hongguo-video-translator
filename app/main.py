@@ -140,6 +140,99 @@ def create_folder_upload(
             logo.file.close()
 
 
+@app.post("/api/batches/start", response_model=BatchResponse, status_code=201)
+def start_chunked_batch(
+    expected_episodes: int = Form(...), options: str = Form("{}"),
+    logo: UploadFile | None = File(default=None),
+):
+    if not 1 <= expected_episodes <= 200:
+        raise HTTPException(400, "Expected episode count must be between 1 and 200")
+    batch = None
+    try:
+        payload = json.loads(options)
+        if not isinstance(payload, dict):
+            raise ValueError("Upload options must be a JSON object")
+        payload.pop("url", None)
+        channel_name = str(payload.pop("channel_name", "")).strip()
+        opacity = float(payload.pop("watermark_opacity", 0.58))
+        if len(channel_name) > 80 or not 0.15 <= opacity <= 0.85:
+            raise ValueError("Invalid channel name or watermark opacity")
+        if bool(channel_name) != bool(logo and logo.filename):
+            raise ValueError("Provide both channel name and channel logo, or leave both empty")
+        request = JobCreate(url="https://upload.local/source.mp4", **payload)
+        batch = batching.create_folder_batch(
+            request.burn_subtitles, request.dub, channel_name, opacity, expected_episodes,
+        )
+        if logo and logo.filename:
+            batching.save_batch_logo(batch["id"], logo.file)
+        return serialize_batch(get_batch(batch["id"]))
+    except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+        if batch:
+            update_batch(batch["id"], status="failed", progress_message="Batch setup failed", error=str(exc))
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        if logo:
+            logo.file.close()
+
+
+@app.post("/api/batches/{batch_id}/chunks", response_model=BatchResponse)
+def upload_batch_chunk(
+    batch_id: str, videos: list[UploadFile] = File(...),
+    positions: str = Form(...), options: str = Form("{}"),
+):
+    batch = get_batch(batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    if batch["status"] != "uploading":
+        raise HTTPException(409, "Batch is no longer accepting uploads")
+    try:
+        requested_positions = json.loads(positions)
+        if (not isinstance(requested_positions, list) or len(requested_positions) != len(videos)
+                or not all(isinstance(item, int) for item in requested_positions)):
+            raise ValueError("Chunk positions must contain one integer per video")
+        expected = int(batch.get("expected_episodes") or 0)
+        if len(set(requested_positions)) != len(requested_positions) or any(item < 1 or item > expected for item in requested_positions):
+            raise ValueError("Chunk positions are duplicated or outside the batch range")
+        existing = {item["position"] for item in get_batch_jobs(batch_id)}
+        if existing.intersection(requested_positions):
+            if set(requested_positions).issubset(existing):
+                return serialize_batch(get_batch(batch_id))
+            raise ValueError("Chunk overlaps positions already uploaded")
+        payload = json.loads(options)
+        if not isinstance(payload, dict):
+            raise ValueError("Upload options must be a JSON object")
+        payload.pop("url", None); payload.pop("channel_name", None); payload.pop("watermark_opacity", None)
+        request = JobCreate(url="https://upload.local/source.mp4", **payload)
+        invalid = [position for position, video in zip(requested_positions, videos) if Path(video.filename or "").suffix.lower() != ".mp4"]
+        if invalid:
+            raise ValueError(f"Positions are not MP4 files: {invalid}")
+        for position, video in zip(requested_positions, videos):
+            row = worker.submit_upload(request, video.filename or f"episode-{position}.mp4", video.file)
+            batching.attach_job(batch_id, row["id"], position, video.filename or f"episode-{position}.mp4")
+        uploaded = len(get_batch_jobs(batch_id))
+        update_batch(batch_id, progress_message=f"Uploaded {uploaded}/{expected} episodes in resumable chunks", error=None)
+        return serialize_batch(get_batch(batch_id))
+    except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+        raise HTTPException(413 if "5 GiB" in str(exc) else 400, str(exc)) from exc
+    finally:
+        for video in videos:
+            video.file.close()
+
+
+@app.post("/api/batches/{batch_id}/finish", response_model=BatchResponse)
+def finish_chunked_batch(batch_id: str):
+    batch = get_batch(batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    episodes = get_batch_jobs(batch_id)
+    expected = int(batch.get("expected_episodes") or 0)
+    if len(episodes) != expected:
+        raise HTTPException(409, f"Uploaded {len(episodes)}/{expected} episodes")
+    update_batch(batch_id, status="queued", progress_message=f"Uploaded all {expected} episodes; processing sequentially", error=None)
+    batching.finalize_batch_for_job(episodes[-1]["id"])
+    return serialize_batch(get_batch(batch_id))
+
+
 @app.get("/api/batches/{batch_id}", response_model=BatchResponse)
 def batch_detail(batch_id: str):
     row = get_batch(batch_id)

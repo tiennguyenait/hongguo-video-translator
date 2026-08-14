@@ -23,13 +23,17 @@ def natural_filename_key(filename: str) -> list[tuple[int, Any]]:
     ]
 
 
-def create_folder_batch(burn_subtitles: bool, dub: bool, channel_name: str = "", watermark_opacity: float = 0.58) -> dict[str, Any]:
+def create_folder_batch(
+    burn_subtitles: bool, dub: bool, channel_name: str = "", watermark_opacity: float = 0.58,
+    expected_episodes: int = 0,
+) -> dict[str, Any]:
     batch_id, now = str(uuid.uuid4()), utc_now()
     batch_directory(batch_id).mkdir(parents=True)
     return create_batch({
         "id": batch_id, "status": "uploading", "progress_message": "Uploading folder videos",
         "error": None, "burn_subtitles": int(burn_subtitles), "dub": int(dub),
         "channel_name": channel_name.strip(), "watermark_opacity": watermark_opacity,
+        "output_filename": "", "expected_episodes": expected_episodes,
         "created_at": now, "updated_at": now,
     })
 
@@ -72,6 +76,8 @@ def batch_directory(batch_id: str) -> Path:
 
 
 def combined_filename(batch: dict[str, Any]) -> str:
+    if batch.get("output_filename"):
+        return str(batch["output_filename"])
     if batch["dub"]:
         return "combined-vi-dubbed.mp4"
     if batch["burn_subtitles"]:
@@ -112,14 +118,14 @@ def finalize_batch_for_job(job_id: str) -> None:
     output = directory / combined_filename(batch)
     try:
         logo = directory / "logo.png"
-        if batch.get("channel_name") and logo.is_file():
-            base = directory / "combined-base.mp4"
-            media.concat_videos(inputs, base)
-            update_batch(batch_id, progress_message="Applying channel logo and name to combined video")
-            media.apply_channel_watermark(base, output, logo, batch["channel_name"], batch["watermark_opacity"])
-            base.unlink(missing_ok=True)
-        else:
-            media.concat_videos(inputs, output)
-        update_batch(batch_id, status="done", progress_message=f"Combined {len(episodes)} episodes successfully", error=None)
+        branded = bool(batch.get("channel_name") and logo.is_file())
+        media.concat_videos(
+            inputs, output, logo if branded else None,
+            batch.get("channel_name", ""), batch.get("watermark_opacity", 0.58),
+        )
+        update_batch(
+            batch_id, status="done", output_filename=output.name,
+            progress_message=f"Combined {len(episodes)} episodes successfully in one encode pass", error=None,
+        )
     except Exception as exc:
         update_batch(batch_id, status="failed", progress_message="Combining episodes failed", error=str(exc))
