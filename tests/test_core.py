@@ -18,7 +18,6 @@ from app.text_normalizer import normalize_spoken_text, vietnamese_integer
 from app.source_subtitle_mask import _candidate_boxes
 from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
 from app.source_subtitle_mask import SubtitleRegion
-from app.semantic_utterance import build_semantic_utterances
 
 
 def test_srt_timestamp_conversion():
@@ -147,45 +146,6 @@ def test_prosody_provider_failure_is_non_fatal():
     result, warning = plan_prosody(plans, "deepseek", lambda *_: (_ for _ in ()).throw(RuntimeError("offline")))
     assert result[0].prosody_source == "fallback"
     assert "offline" in warning
-
-
-def test_semantic_reflow_merges_fragments_and_preserves_every_cue():
-    source = [
-        srt.Subtitle(1, timedelta(seconds=1), timedelta(seconds=3), "是你们千灵宗灭"),
-        srt.Subtitle(2, timedelta(seconds=4), timedelta(seconds=5), "门之"),
-        srt.Subtitle(3, timedelta(seconds=8), timedelta(seconds=10), "日仇魁境突破"),
-    ]
-    translated = [
-        srt.Subtitle(1, source[0].start, source[0].end, "Chính các người đã diệt Càn Linh Tông"),
-        srt.Subtitle(2, source[1].start, source[1].end, "chúng ta"),
-        srt.Subtitle(3, source[2].start, source[2].end, "Cừu Khôi Cảnh đã đột phá"),
-    ]
-    raw = '{"utterances":[{"cue_ids":[1,2],"text":"Hôm nay là ngày Càn Linh Tông các ngươi bị diệt môn."},{"cue_ids":[3],"text":"Cừu Khôi Cảnh đã đột phá."}]}'
-    result, warning = build_semantic_utterances(translated, source, {1: "A", 3: "A"}, "deepseek", lambda *_: raw)
-    assert warning is None
-    assert [item.cue_ids for item in result] == [[1, 2], [3]]
-    assert result[0].text == "Hôm nay là ngày Càn Linh Tông các ngươi bị diệt môn."
-
-
-def test_semantic_reflow_invalid_ai_uses_safe_fragment_fallback():
-    cues = [
-        srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "Anh sẽ cứu em"),
-        srt.Subtitle(2, timedelta(seconds=2.2), timedelta(seconds=3), "bằng mọi giá"),
-    ]
-    result, warning = build_semantic_utterances(cues, cues, {1: "A", 2: "A"}, "deepseek", lambda *_: '{"utterances":[]}')
-    assert [item.cue_ids for item in result] == [[1, 2]]
-    assert result[0].text == "Anh sẽ cứu em bằng mọi giá"
-    assert "fallback" in warning
-
-
-def test_semantic_fallback_joins_ellipsis_continuation():
-    cues = [
-        srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "Phụ nữ chỉ khiến ta chậm tay..."),
-        srt.Subtitle(2, timedelta(seconds=2), timedelta(seconds=3), "khi rút kiếm."),
-    ]
-    result, _ = build_semantic_utterances(cues, cues, {1: "A", 2: "A"}, "deepseek", lambda *_: 'invalid')
-    assert [item.cue_ids for item in result] == [[1, 2]]
-    assert result[0].text == "Phụ nữ chỉ khiến ta chậm tay... khi rút kiếm."
 
 
 def test_artifact_manifest_requires_matching_fingerprint_and_files(tmp_path):

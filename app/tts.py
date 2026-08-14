@@ -3,7 +3,6 @@ import json
 import re
 import subprocess
 import shutil
-from datetime import timedelta
 from pathlib import Path
 
 import edge_tts
@@ -16,7 +15,6 @@ from .voice_profiles import classify_speaker_voices
 from .artifacts import atomic_write_json, stable_hash
 from .speech_plan import build_speech_plans
 from .prosody import PROSODY_VERSION, plan_prosody
-from .semantic_utterance import build_semantic_utterances
 
 
 def _fit_audio_to_window(audio: AudioSegment, target_ms: int, work_path: Path) -> AudioSegment:
@@ -155,7 +153,6 @@ def create_dub(
     voice_overrides: dict[str, str] | None = None,
     narrator_mode: bool = True,
     provider: str = "deepseek",
-    source_subtitles: list[srt.Subtitle] | None = None,
 ) -> Path:
     clips_dir = job_dir / "tts"
     clips_dir.mkdir(exist_ok=True)
@@ -174,20 +171,7 @@ def create_dub(
         )
     else:
         profiles = classify_speaker_voices(video, subtitles, speakers, voice, secondary_voice, voice_overrides)
-    semantic, semantic_warning = build_semantic_utterances(
-        subtitles, source_subtitles or subtitles, speakers, provider,
-    )
-    atomic_write_json(job_dir / "semantic-utterances.json", {
-        "warning": semantic_warning, "items": [item.to_dict() for item in semantic],
-    })
-    utterances = [(
-        srt.Subtitle(
-            index=item.id,
-            start=timedelta(seconds=item.start),
-            end=timedelta(seconds=item.end),
-            content=item.text,
-        ), item.speaker,
-    ) for item in semantic]
+    utterances = build_utterances(subtitles, speakers)
     plans = build_speech_plans(utterances, video_duration_ms)
     prosody_warning = None
     if narrator_mode:
