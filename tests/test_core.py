@@ -38,6 +38,9 @@ def test_translation_json_parsing_and_validation():
     assert parse_translation_json('{"id":1,"text":"Xin"}\n{"id":2,"text":"chào"}', [1, 2]) == {1: "Xin", 2: "chào"}
     assert parse_translation_json('[{"id":1,"translation":"Xin chào"}]', [1]) == {1: "Xin chào"}
     assert parse_translation_json('{"id":1,"text":"Xin chào"}', [1]) == {1: "Xin chào"}
+    assert parse_translation_json(
+        '[{"cue_id":1,"shortened_text":"Xin chào"},{"index":2,"content":{"text":"bạn"}}]', [1, 2],
+    ) == {1: "Xin chào", 2: "bạn"}
     with pytest.raises(ValueError, match="missing"):
         parse_translation_json('[]', [1])
 

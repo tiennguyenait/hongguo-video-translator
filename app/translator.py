@@ -195,6 +195,14 @@ def translate_subtitles(
                 last_error = exc
                 if attempt == settings.translation_retries:
                     raise RuntimeError(f"Translation batch failed after {attempt} attempts: {exc}") from exc
+                if isinstance(exc, ValueError):
+                    prompt += (
+                        "\n\nRETRY REQUIRED: The previous response failed validation: "
+                        f"{exc}. Return JSON only in exactly this shape: "
+                        '{"translations":[{"id":1,"text":"Vietnamese text"}]}. '
+                        f"Return every expected id exactly once: {expected_ids}. "
+                        "Do not use alternate field names, null values, markdown, or explanations."
+                    )
                 time.sleep(attempt * 2)
         else:
             raise RuntimeError(str(last_error))

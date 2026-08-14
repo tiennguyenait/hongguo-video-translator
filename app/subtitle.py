@@ -64,10 +64,22 @@ def parse_translation_json(raw: str, expected_ids: list[int]) -> dict[int, str]:
         raise ValueError("Translation response must be an array or contain a translations array")
     result: dict[int, str] = {}
     for item in payload:
+        if isinstance(item, dict) and "id" not in item:
+            for alias in ("cue_id", "cueId", "index"):
+                if alias in item:
+                    item = {**item, "id": item[alias]}
+                    break
         if isinstance(item, dict) and "text" not in item:
-            for alias in ("translation", "translated_text", "translatedText"):
-                if isinstance(item.get(alias), str):
-                    item = {**item, "text": item[alias]}
+            for alias in (
+                "translation", "translated_text", "translatedText", "translated",
+                "vietnamese", "shortened_text", "shortenedText", "content", "output",
+            ):
+                value = item.get(alias)
+                if isinstance(value, str):
+                    item = {**item, "text": value}
+                    break
+                if isinstance(value, dict) and isinstance(value.get("text"), str):
+                    item = {**item, "text": value["text"]}
                     break
         if not isinstance(item, dict) or "id" not in item or not isinstance(item.get("text"), str):
             raise ValueError("Every translation item must contain id and text")
