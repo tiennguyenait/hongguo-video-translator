@@ -48,6 +48,14 @@ def test_default_job_keeps_source_subtitles_and_enables_vietnamese_dub():
     assert job.original_audio_volume == 0.08
 
 
+def test_single_upload_ui_uses_branded_batch_pipeline():
+    html = (Path(__file__).parents[1] / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    assert 'id="brandingOptions"' in html
+    assert "mode==='folder'||mode==='upload'" in html
+    assert "endpoint='/api/batches/upload'" in html
+    assert "data.append('logo',logo,logo.name)" in html
+
+
 def test_folder_episode_names_use_natural_numeric_order():
     names = ["tap-10.mp4", "tap-2.mp4", "tap-3.mp4", "tap-1.mp4"]
     assert sorted(names, key=natural_filename_key) == ["tap-1.mp4", "tap-2.mp4", "tap-3.mp4", "tap-10.mp4"]
