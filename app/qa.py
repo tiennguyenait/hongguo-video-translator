@@ -49,6 +49,26 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
         add("tts_speed", "pass" if not rushed else "warning", "TTS speed is within natural limits" if not rushed else f"Review rushed utterances: {rushed[:20]}")
         add("tts_deadlines", "pass" if not overflow else "warning", "TTS clips fit their windows" if not overflow else f"Audio exceeds windows: {overflow[:20]}")
 
+    master_path = job_dir / "dialogue-master.json"
+    if master_path.is_file():
+        master = json.loads(master_path.read_text(encoding="utf-8"))
+        utterances = master.get("utterances", [])
+        display = master.get("display_lines", [])
+        display_ids = [item.get("id") for item in display]
+        utterance_ids = [item_id for item in utterances for item_id in item.get("cue_ids", [])]
+        exact_ids = display_ids == expected_ids and utterance_ids == expected_ids
+        add("dialogue_master_ids", "pass" if exact_ids else "error", "Dialogue master preserves one display line per source cue" if exact_ids else "Dialogue master lost, duplicated, or reordered cue ids")
+        display_by_id = {item.get("id"): item.get("text", "") for item in display}
+        mismatched = []
+        for item in utterances:
+            shown = " ".join(display_by_id.get(item_id, "") for item_id in item.get("cue_ids", []))
+            words = lambda text: re.findall(r"[\wÀ-ỹ]+", text.casefold(), re.UNICODE)
+            if words(shown) != words(item.get("full_text", "")):
+                mismatched.append(item.get("id"))
+        add("dialogue_master_consistency", "pass" if not mismatched else "error", "Display lines and TTS share identical ordered words" if not mismatched else f"Display/TTS mismatch in utterances: {mismatched}")
+        master_warning = master.get("warning")
+        add("dialogue_master_provider", "pass" if not master_warning else "warning", "AI dialogue master validated" if not master_warning else master_warning)
+
     regions_path = job_dir / "subtitle-regions.json"
     if regions_path.is_file():
         mask = json.loads(regions_path.read_text(encoding="utf-8"))

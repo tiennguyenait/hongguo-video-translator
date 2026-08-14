@@ -18,6 +18,7 @@ from app.text_normalizer import normalize_spoken_text, vietnamese_integer
 from app.source_subtitle_mask import _candidate_boxes
 from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
 from app.source_subtitle_mask import SubtitleRegion
+from app.dialogue_master import build_dialogue_master
 
 
 def test_srt_timestamp_conversion():
@@ -146,6 +147,60 @@ def test_prosody_provider_failure_is_non_fatal():
     result, warning = plan_prosody(plans, "deepseek", lambda *_: (_ for _ in ()).throw(RuntimeError("offline")))
     assert result[0].prosody_source == "fallback"
     assert "offline" in warning
+
+
+def test_dialogue_master_preserves_original_lines_and_shared_tts_words():
+    source = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "是你们千灵宗灭"),
+        srt.Subtitle(2, timedelta(seconds=2), timedelta(seconds=4), "门之日"),
+    ]
+    draft = [
+        srt.Subtitle(1, source[0].start, source[0].end, "Bản dịch bị"),
+        srt.Subtitle(2, source[1].start, source[1].end, "đứt đoạn"),
+    ]
+    raw = '{"utterances":[{"cue_ids":[1,2],"full_text":"Hôm nay môn phái của các ngươi bị diệt.","display_lines":[{"id":1,"text":"Hôm nay môn phái"},{"id":2,"text":"của các ngươi bị diệt."}]}]}'
+    display, utterances, warning = build_dialogue_master(draft, source, {1: "A", 2: "A"}, "deepseek", request=lambda *_: raw)
+    assert warning is None
+    assert [cue.index for cue in display] == [1, 2]
+    assert [cue.content for cue in display] == ["Hôm nay môn phái", "của các ngươi bị diệt."]
+    assert utterances[0].cue_ids == [1, 2]
+    assert utterances[0].full_text == "Hôm nay môn phái của các ngươi bị diệt."
+
+
+def test_dialogue_master_rejects_display_tts_word_mismatch():
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "Xin chào")
+    invalid = '{"utterances":[{"cue_ids":[1],"full_text":"Xin chào bạn","display_lines":[{"id":1,"text":"Xin chào"}]}]}'
+    display, utterances, warning = build_dialogue_master([cue], [cue], {}, "deepseek", request=lambda *_: invalid)
+    assert warning and "retained safe draft" in warning
+    assert display[0].content == "Xin chào"
+    assert utterances[0].full_text == "Xin chào"
+
+
+def test_dialogue_master_repairs_empty_ai_display_line_without_changing_words():
+    cues = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "甲"),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=2), "乙"),
+    ]
+    raw = '{"utterances":[{"cue_ids":[1,2],"full_text":"Chính là ngày môn phái bị diệt.","display_lines":[{"id":1,"text":"Chính là ngày môn phái bị diệt."},{"id":2,"text":""}]}]}'
+    display, utterances, warning = build_dialogue_master(cues, cues, {}, "deepseek", request=lambda *_: raw)
+    assert warning is None
+    assert all(cue.content for cue in display)
+    assert " ".join(cue.content for cue in display) == utterances[0].full_text
+
+
+def test_dialogue_master_splits_tts_at_known_speaker_boundary():
+    cues = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "甲"),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=2), "乙"),
+    ]
+    raw = '{"utterances":[{"cue_ids":[1,2],"full_text":"Anh hỏi. Tôi trả lời.","display_lines":[{"id":1,"text":"Anh hỏi."},{"id":2,"text":"Tôi trả lời."}]}]}'
+    display, utterances, warning = build_dialogue_master(
+        cues, cues, {1: "A", 2: "B"}, "deepseek", request=lambda *_: raw,
+    )
+    assert warning is None
+    assert [item.cue_ids for item in utterances] == [[1], [2]]
+    assert [item.full_text for item in utterances] == ["Anh hỏi.", "Tôi trả lời."]
+    assert [cue.content for cue in display] == ["Anh hỏi.", "Tôi trả lời."]
 
 
 def test_artifact_manifest_requires_matching_fingerprint_and_files(tmp_path):

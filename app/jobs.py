@@ -7,7 +7,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from . import downloader, media, qa, speech_pipeline, translator, tts
+import srt
+
+from . import dialogue_master, downloader, media, qa, speech_pipeline, translator, tts
 from .artifacts import ArtifactManifest, stable_hash
 from .artifacts import atomic_write_json
 from .dialogue import build_dialogue_units, repair_fragment_speakers
@@ -185,20 +187,52 @@ class JobWorker:
             )
             write_srt(translated_srt, translated)
             manifest.complete("translation", translation_fingerprint, [translated_srt, directory / "vi-final.json"], {"cues": len(translated)})
+        # The final translation draft is stable even after vi.srt is redistributed
+        # into original display-line slots by the dialogue master.
+        draft_payload = json.loads((directory / "vi-final.json").read_text(encoding="utf-8"))
+        draft_mapping = {int(item["id"]): str(item["text"]) for item in draft_payload}
+        draft = [srt.Subtitle(cue.index, cue.start, cue.end, draft_mapping.get(cue.index, cue.content)) for cue in translated]
+        regions: list[SubtitleRegion] = []
+        regions_path = directory / "subtitle-regions.json"
+        mask_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "detector": "visual-tracks-v2"})
+        if job["burn_subtitles"] and job.get("hide_source_subtitles", 1):
+            if manifest.valid("source_subtitle_mask", mask_fingerprint, [regions_path]):
+                payload = json.loads(regions_path.read_text(encoding="utf-8"))
+                regions = [SubtitleRegion(**item) for item in payload.get("regions", [])]
+                self._progress(job_id, JobStep.DETECTING_SUBTITLES, "Resuming detected source subtitle mask")
+            else:
+                self._progress(job_id, JobStep.DETECTING_SUBTITLES, "Automatically locating burned-in source subtitles")
+                regions = detect_source_subtitle_regions(video, subtitles, regions_path)
+                manifest.complete("source_subtitle_mask", mask_fingerprint, [regions_path], {"regions": len(regions)})
+        box_widths = {}
+        for cue in draft:
+            start, end = cue.start.total_seconds(), cue.end.total_seconds()
+            matching = sorted(regions, key=lambda region: max(0.0, min(end, region.end)-max(start, region.start)), reverse=True)
+            if matching:
+                box_widths[cue.index] = matching[0].width
+        master_path = directory / "dialogue-master.json"
+        master_fingerprint = stable_hash({
+            "draft": [(cue.index, cue.content) for cue in draft], "source": [(cue.index, cue.content) for cue in subtitles],
+            "speakers": speakers, "provider": job["provider"], "boxes": box_widths, "pipeline": "display-lines-v3",
+        })
+        if manifest.valid("dialogue_master", master_fingerprint, [translated_srt, master_path]):
+            translated = read_srt(translated_srt)
+            master_payload = json.loads(master_path.read_text(encoding="utf-8"))
+            self._progress(job_id, JobStep.TRANSLATING, "Resuming validated dialogue master")
+        else:
+            self._progress(job_id, JobStep.TRANSLATING, "Reflowing complete dialogue into original display lines")
+            translated, master_utterances, master_warning = dialogue_master.build_dialogue_master(
+                draft, subtitles, speakers, job["provider"], box_widths,
+            )
+            write_srt(translated_srt, translated)
+            master_payload = {
+                "warning": master_warning, "utterances": [item.to_dict() for item in master_utterances],
+                "display_lines": [{"id": cue.index, "text": cue.content} for cue in translated],
+            }
+            atomic_write_json(master_path, master_payload)
+            manifest.complete("dialogue_master", master_fingerprint, [translated_srt, master_path], {"utterances": len(master_utterances)})
         if job["burn_subtitles"]:
             burned = directory / "vi-burned.mp4"
-            regions: list[SubtitleRegion] = []
-            regions_path = directory / "subtitle-regions.json"
-            mask_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "detector": "visual-tracks-v2"})
-            if job.get("hide_source_subtitles", 1):
-                if manifest.valid("source_subtitle_mask", mask_fingerprint, [regions_path]):
-                    payload = json.loads(regions_path.read_text(encoding="utf-8"))
-                    regions = [SubtitleRegion(**item) for item in payload.get("regions", [])]
-                    self._progress(job_id, JobStep.DETECTING_SUBTITLES, "Resuming detected source subtitle mask")
-                else:
-                    self._progress(job_id, JobStep.DETECTING_SUBTITLES, "Automatically locating burned-in source subtitles")
-                    regions = detect_source_subtitle_regions(video, subtitles, regions_path)
-                    manifest.complete("source_subtitle_mask", mask_fingerprint, [regions_path], {"regions": len(regions)})
             burn_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "srt": translated_srt.read_text(encoding="utf-8"), "style": "adaptive-ass-v9-track-envelope-timing", "mask": [region.to_dict() for region in regions]})
             expected_burn_files = [burned] + ([directory / "vi.ass", directory / "subtitle-layout.json"] if regions else [])
             if manifest.valid("burn", burn_fingerprint, expected_burn_files):
@@ -211,7 +245,7 @@ class JobWorker:
             dub_video_base = directory / "vi-burned.mp4" if job["burn_subtitles"] else video
             dubbed = directory / "vi-dubbed.mp4"
             base_stat = dub_video_base.stat()
-            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "video_base": [base_stat.st_size, base_stat.st_mtime_ns], "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "sidechain-v3-48k", "prosody": "conservative-v1"})
+            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "master": master_payload, "video_base": [base_stat.st_size, base_stat.st_mtime_ns], "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "sidechain-v3-48k", "prosody": "conservative-v1"})
             if manifest.valid("dub", dub_fingerprint, [dubbed, directory / "speech-plan.json", directory / "prosody-plan.json", directory / "tts-timing.json"]):
                 self._progress(job_id, JobStep.DUBBING, "Resuming from cached Vietnamese dub")
             else:
@@ -223,12 +257,13 @@ class JobWorker:
                     json.loads(job.get("voice_overrides") or "{}"),
                     bool(job.get("narrator_mode", 1)),
                     job["provider"],
+                    master_payload.get("utterances"),
                 )
                 manifest.complete("dub", dub_fingerprint, [dubbed, directory / "speech-plan.json", directory / "prosody-plan.json", directory / "tts-timing.json"])
         self._progress(job_id, JobStep.QA, "Running automatic content, timing, and media QA")
         final_video = directory / "vi-dubbed.mp4" if job["dub"] else directory / "vi-burned.mp4" if job["burn_subtitles"] else video
         report = qa.validate_job(directory, translated, [cue.index for cue in subtitles], final_video)
-        manifest.complete("qa", stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "output_bytes": final_video.stat().st_size}), [directory / "qa-report.json"], report["summary"])
+        manifest.complete("qa", stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "master": master_payload, "output_bytes": final_video.stat().st_size}), [directory / "qa-report.json"], report["summary"])
         status = JobStatus.NEEDS_REVIEW if report["summary"]["error"] else JobStatus.DONE
         message = f"QA complete: {report['summary']['pass']} passed, {report['summary']['warning']} warnings, {report['summary']['error']} errors"
         update_job(job_id, status=status, step=JobStep.DONE, progress_message=message, error=None)
@@ -256,8 +291,8 @@ def apply_subtitle_review(job_id: str, edits: dict[int, str]) -> None:
     translation = manifest.data.get("artifacts", {}).get("translation")
     if translation:
         manifest.complete("translation", translation["fingerprint"], [translated_path, directory / "vi-final.json"], {"cues": len(subtitles), "human_reviewed": True})
-        manifest.invalidate_after(["download", "transcript", "source_subtitle_mask", "translation", "burn", "dub", "qa"], "translation")
-    for filename in ("vi-burned.mp4", "vi-dubbed.mp4", "vi.ass", "subtitle-layout.json", "qa-report.json"):
+        manifest.invalidate_after(["download", "transcript", "source_subtitle_mask", "translation", "dialogue_master", "burn", "dub", "qa"], "translation")
+    for filename in ("dialogue-master.json", "vi-burned.mp4", "vi-dubbed.mp4", "vi.ass", "subtitle-layout.json", "qa-report.json"):
         (directory / filename).unlink(missing_ok=True)
 
 

@@ -153,6 +153,7 @@ def create_dub(
     voice_overrides: dict[str, str] | None = None,
     narrator_mode: bool = True,
     provider: str = "deepseek",
+    master_utterances: list[dict] | None = None,
 ) -> Path:
     clips_dir = job_dir / "tts"
     clips_dir.mkdir(exist_ok=True)
@@ -171,7 +172,16 @@ def create_dub(
         )
     else:
         profiles = classify_speaker_voices(video, subtitles, speakers, voice, secondary_voice, voice_overrides)
-    utterances = build_utterances(subtitles, speakers)
+    if master_utterances:
+        from datetime import timedelta
+        utterances = [(
+            srt.Subtitle(
+                index=int(item["id"]), start=timedelta(seconds=float(item["start"])),
+                end=timedelta(seconds=float(item["end"])), content=str(item["full_text"]),
+            ), item.get("speaker"),
+        ) for item in master_utterances]
+    else:
+        utterances = build_utterances(subtitles, speakers)
     plans = build_speech_plans(utterances, video_duration_ms)
     prosody_warning = None
     if narrator_mode:
