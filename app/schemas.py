@@ -17,6 +17,7 @@ class JobCreate(BaseModel):
     target_language: str = Field(default="Vietnamese", min_length=2, max_length=50)
     glossary: str | None = Field(default=None, max_length=10_000)
     burn_subtitles: bool = True
+    hide_source_subtitles: bool = True
     dub: bool = False
     narrator_mode: bool = True
     tts_voice: str = Field(default="Ngọc Huyền — authorized clone", max_length=100)
@@ -41,6 +42,7 @@ class JobOutputs(BaseModel):
     dubbed_video: str | None = None
     speaker_report: str | None = None
     qa_report: str | None = None
+    subtitle_regions: str | None = None
 
 
 class JobResponse(BaseModel):
@@ -54,6 +56,7 @@ class JobResponse(BaseModel):
     asr_model: str
     diarize: bool
     burn_subtitles: bool
+    hide_source_subtitles: bool
     dub: bool
     created_at: datetime
     updated_at: datetime

@@ -52,6 +52,8 @@ def init_db() -> None:
             db.execute("ALTER TABLE jobs ADD COLUMN voice_overrides TEXT NOT NULL DEFAULT '{}'")
         if "narrator_mode" not in columns:
             db.execute("ALTER TABLE jobs ADD COLUMN narrator_mode INTEGER NOT NULL DEFAULT 1")
+        if "hide_source_subtitles" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN hide_source_subtitles INTEGER NOT NULL DEFAULT 1")
 
 
 def create_job(values: dict[str, Any]) -> dict[str, Any]:

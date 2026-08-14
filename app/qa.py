@@ -49,6 +49,14 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
         add("tts_speed", "pass" if not rushed else "warning", "TTS speed is within natural limits" if not rushed else f"Review rushed utterances: {rushed[:20]}")
         add("tts_deadlines", "pass" if not overflow else "warning", "TTS clips fit their windows" if not overflow else f"Audio exceeds windows: {overflow[:20]}")
 
+    regions_path = job_dir / "subtitle-regions.json"
+    if regions_path.is_file():
+        mask = json.loads(regions_path.read_text(encoding="utf-8"))
+        regions = mask.get("regions", [])
+        confidence = min((item.get("confidence", 0) for item in regions), default=0)
+        severity = "pass" if confidence >= 0.5 else "warning"
+        add("source_subtitle_mask", severity, f"Detected {len(regions)} source subtitle intervals at confidence {confidence:.2f} ({mask.get('method')})")
+
     if output_video and output_video.is_file():
         try:
             probe = _probe(output_video)

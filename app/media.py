@@ -1,5 +1,9 @@
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .source_subtitle_mask import SubtitleRegion
 
 
 def run_ffmpeg(command: list[str]) -> None:
@@ -29,8 +33,16 @@ def _subtitle_filter(path: Path) -> str:
     return f"subtitles=filename='{escaped}':force_style='{style}'"
 
 
-def burn_subtitles(video: Path, subtitle: Path, output: Path) -> None:
-    run_ffmpeg(["ffmpeg", "-y", "-i", str(video), "-vf", _subtitle_filter(subtitle), "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "copy", "-movflags", "+faststart", str(output)])
+def burn_subtitles(video: Path, subtitle: Path, output: Path, regions: list["SubtitleRegion"] | None = None) -> None:
+    filters: list[str] = []
+    for region in regions or []:
+        enable = f"between(t\\,{region.start:.3f}\\,{region.end:.3f})"
+        filters.append(
+            f"drawbox=x={region.x}:y={region.y}:w={region.width}:h={region.height}:"
+            f"color=black@1.0:t=fill:enable='{enable}'"
+        )
+    filters.append(_subtitle_filter(subtitle))
+    run_ffmpeg(["ffmpeg", "-y", "-i", str(video), "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "copy", "-movflags", "+faststart", str(output)])
 
 
 def mux_dub(video: Path, wav: Path, output: Path, original_audio_volume: float) -> None:

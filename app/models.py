@@ -14,6 +14,7 @@ class JobStep(StrEnum):
     DOWNLOADING = "downloading"
     TRANSCRIBING = "transcribing"
     TRANSLATING = "translating"
+    DETECTING_SUBTITLES = "detecting_subtitles"
     BURNING = "burning"
     DUBBING = "dubbing"
     QA = "qa"

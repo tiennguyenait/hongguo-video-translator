@@ -14,6 +14,7 @@ from app.artifacts import ArtifactManifest, stable_hash
 from app.dialogue import build_dialogue_units, repair_fragment_speakers
 from app.speech_plan import build_speech_plans, predict_duration_ms
 from app.text_normalizer import normalize_spoken_text, vietnamese_integer
+from app.source_subtitle_mask import _candidate_boxes
 
 
 def test_srt_timestamp_conversion():
@@ -151,6 +152,17 @@ def test_human_review_updates_translation_and_invalidates_rendered_files(monkeyp
     assert read_srt(directory / "vi.srt")[0].content == "Bản sửa tự nhiên hơn"
     assert not (directory / "vi-dubbed.mp4").exists()
     assert "dub" not in ArtifactManifest(directory).data["artifacts"]
+
+
+def test_source_subtitle_detector_finds_centered_bright_text_but_not_plain_scene():
+    import cv2
+    import numpy as np
+    frame = np.full((720, 1280, 3), 40, dtype=np.uint8)
+    cv2.putText(frame, "SOURCE SUBTITLE", (390, 665), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 255), 4, cv2.LINE_AA)
+    boxes = _candidate_boxes(frame)
+    assert boxes
+    assert boxes[0][1] > 580
+    assert not _candidate_boxes(np.full((720, 1280, 3), 40, dtype=np.uint8))
 
 
 def test_word_grouping_does_not_split_on_noisy_character_speakers():
