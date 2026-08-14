@@ -180,18 +180,21 @@ def translate_subtitles(
                     mapping.update(parse_translation_json(shortened_raw, overlong))
                     overlong = [item_id for item_id in overlong if len(mapping[item_id].split()) > limits[item_id] + 2]
                 if target_language.lower().startswith("vietnam") and overlong:
-                    raise ValueError(f"Vietnamese dialogue exceeds speaking-time budget for ids: {overlong}")
+                    # A short ASR cue is often only the tail of a sentence. Failing the
+                    # whole job here prevents the dialogue-master stage from joining it
+                    # with adjacent cues and using their combined speaking window.
+                    # Keep the best shortened text and let final timing QA decide whether
+                    # the grouped TTS audio is genuinely too long.
+                    if progress:
+                        progress(
+                            "Translation retained for dialogue reflow despite a tight "
+                            f"speaking window in cues: {overlong}"
+                        )
                 break
             except Exception as exc:
                 last_error = exc
                 if attempt == settings.translation_retries:
                     raise RuntimeError(f"Translation batch failed after {attempt} attempts: {exc}") from exc
-                if "speaking-time budget" in str(exc):
-                    prompt += (
-                        "\n\nRETRY REQUIRED: Your previous answer was too long for the ids listed in this error: "
-                        f"{exc}. Rewrite those lines much more concisely. Every line must stay within its max_words; "
-                        "use an idiomatic Vietnamese equivalent and omit redundant wording. Return the complete JSON batch again."
-                    )
                 time.sleep(attempt * 2)
         else:
             raise RuntimeError(str(last_error))

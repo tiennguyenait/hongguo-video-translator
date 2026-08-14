@@ -19,6 +19,7 @@ from app.source_subtitle_mask import _candidate_boxes
 from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
 from app.source_subtitle_mask import SubtitleRegion
 from app.dialogue_master import build_dialogue_master
+from app.translator import translate_subtitles
 
 
 def test_srt_timestamp_conversion():
@@ -37,6 +38,26 @@ def test_translation_json_parsing_and_validation():
     assert parse_translation_json('{"id":1,"text":"Xin chào"}', [1]) == {1: "Xin chào"}
     with pytest.raises(ValueError, match="missing"):
         parse_translation_json('[]', [1])
+
+
+def test_translation_over_budget_is_deferred_to_dialogue_timing(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"translation_scene_review": False})
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    responses = []
+
+    def provider(*_):
+        responses.append(1)
+        return '{"translations":[{"id":10,"text":"Trưởng lão đã chú ý, tuyệt đối không được đắc tội."}]}'
+
+    monkeypatch.setattr("app.translator._openai_compatible", provider)
+    cue = srt.Subtitle(10, timedelta(0), timedelta(seconds=1.421), "老已经看中我万不可得罪")
+    messages = []
+    translated = translate_subtitles(
+        [cue], "deepseek", "Chinese", "Vietnamese", progress=messages.append, job_dir=tmp_path,
+    )
+    assert translated[0].content.startswith("Trưởng lão")
+    assert len(responses) == 2  # initial translation plus one shortening attempt
+    assert any("dialogue reflow" in message for message in messages)
 
 
 def test_safe_job_path(monkeypatch, tmp_path: Path):

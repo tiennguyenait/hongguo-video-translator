@@ -16,6 +16,8 @@ from .artifacts import atomic_write_json, stable_hash
 from .speech_plan import build_speech_plans
 from .prosody import PROSODY_VERSION, plan_prosody
 
+MAX_NATURAL_TEMPO = 1.35
+
 
 def _fit_audio_to_window(audio: AudioSegment, target_ms: int, work_path: Path) -> AudioSegment:
     """Pitch-preserving time stretch, bounded to keep the voice natural."""
@@ -26,7 +28,7 @@ def _fit_audio_to_window(audio: AudioSegment, target_ms: int, work_path: Path) -
     # Slowing it down to fill every millisecond destroys emphasis and cadence.
     if tempo <= 1.03:
         return audio
-    tempo = min(1.22, tempo)
+    tempo = min(MAX_NATURAL_TEMPO, tempo)
     input_path = work_path.with_suffix(".timing-input.wav")
     output_path = work_path.with_suffix(".timing.wav")
     audio.export(input_path, format="wav")
