@@ -38,7 +38,13 @@ def serialize_batch(row: dict) -> dict:
     return {
         "id": batch_id, "status": row["status"], "progress_message": row["progress_message"],
         "error": row["error"], "created_at": row["created_at"], "updated_at": row["updated_at"],
-        "output": f"/api/batches/{batch_id}/files/{output_name}" if output_path.is_file() else None,
+        # FFmpeg creates the destination before it has finalized the MP4.  An
+        # existing file is therefore not evidence that it is safe to stream.
+        "output": (
+            f"/api/batches/{batch_id}/files/{output_name}"
+            if row["status"] == "done" and output_path.is_file()
+            else None
+        ),
         "episodes": [
             {"position": item["position"], "filename": item["filename"], "job": serialize_job(item)}
             for item in episodes
@@ -249,6 +255,8 @@ def batch_file(batch_id: str, filename: str):
     expected = batching.combined_filename(row)
     if filename != expected:
         raise HTTPException(400, "Invalid batch filename")
+    if row["status"] != "done":
+        raise HTTPException(409, "Combined video is still being finalized")
     path = batching.batch_directory(batch_id) / filename
     if not path.is_file():
         raise HTTPException(404, "Combined video is not ready")

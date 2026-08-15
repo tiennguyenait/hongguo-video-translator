@@ -53,6 +53,7 @@ def test_single_upload_ui_uses_branded_batch_pipeline():
     assert 'id="brandingOptions"' in html
     assert "'/api/batches/upload'" in html
     assert "'/api/batches/start'" in html
+    assert "batch.status==='done'&&batch.output" in html
     assert "offset+=15" in html
     assert "data.append('logo',logo,logo.name)" in html
     assert "selected.filter(file=>file.name.toLowerCase().endsWith('.mp4'))" in html
