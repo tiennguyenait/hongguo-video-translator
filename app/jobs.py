@@ -263,7 +263,7 @@ class JobWorker:
         master_path = directory / "dialogue-master.json"
         master_fingerprint = stable_hash({
             "draft": [(cue.index, cue.content) for cue in draft], "source": [(cue.index, cue.content) for cue in subtitles],
-            "speakers": speakers, "provider": job["provider"], "boxes": box_widths, "pipeline": "display-lines-v3",
+            "speakers": speakers, "provider": job["provider"], "boxes": box_widths, "pipeline": "display-lines-v4-sentence-tts",
         })
         if manifest.valid("dialogue_master", master_fingerprint, [translated_srt, master_path]):
             master_payload = json.loads(master_path.read_text(encoding="utf-8"))
@@ -302,7 +302,7 @@ class JobWorker:
             dub_video_base = directory / "vi-burned.mp4" if job["burn_subtitles"] else video
             dubbed = directory / "vi-dubbed.mp4"
             base_stat = dub_video_base.stat()
-            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "master": master_payload, "video_base": [base_stat.st_size, base_stat.st_mtime_ns], "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "sidechain-v4-48k-aac128", "prosody": "conservative-v1", "timing": "atempo-v2-1.35"})
+            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "master": master_payload, "video_base": [base_stat.st_size, base_stat.st_mtime_ns], "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "sidechain-v4-48k-aac128", "prosody": "conservative-v1", "timing": "sentence-utterance-v3-1.35"})
             if manifest.valid("dub", dub_fingerprint, [dubbed, directory / "speech-plan.json", directory / "prosody-plan.json", directory / "tts-timing.json"]):
                 self._progress(job_id, JobStep.DUBBING, "Resuming from cached Vietnamese dub")
             else:

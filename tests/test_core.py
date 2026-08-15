@@ -1,5 +1,6 @@
 from datetime import timedelta
 from io import BytesIO
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,7 @@ from app.text_normalizer import normalize_spoken_text, vietnamese_integer
 from app.source_subtitle_mask import _candidate_boxes
 from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
 from app.source_subtitle_mask import SubtitleRegion
-from app.dialogue_master import build_dialogue_master
+from app.dialogue_master import _coalesce_speech_groups, build_dialogue_master
 from app.translator import translate_subtitles
 from app.media import AUDIO_BITRATE, VIDEO_CRF, _merge_video_encode_args, apply_channel_watermark, concat_videos, probe_duration, probe_video_size
 from app.batching import _unique_output_filename, finalize_batch_for_job, natural_filename_key
@@ -139,6 +140,65 @@ def test_channel_watermark_renders_and_preserves_timing(tmp_path):
     assert probe_video_size(output) == (320, 180)
     assert abs(probe_duration(output) - probe_duration(source)) < 0.08
     subprocess.run(["ffmpeg", "-v", "error", "-i", str(output), "-f", "null", "-"], check=True)
+
+
+def test_speech_groups_continue_across_display_lines_until_source_sentence_end():
+    draft = [
+        srt.Subtitle(1, timedelta(seconds=0), timedelta(seconds=1), "Chính các người đã diệt môn phái."),
+        srt.Subtitle(2, timedelta(seconds=1.1), timedelta(seconds=2), "Thiên Linh Tông chúng ta,"),
+        srt.Subtitle(3, timedelta(seconds=2.1), timedelta(seconds=3), "hôm nay phải trả giá!"),
+        srt.Subtitle(4, timedelta(seconds=3.2), timedelta(seconds=4), "Không thể nào."),
+    ]
+    source = [
+        srt.Subtitle(1, draft[0].start, draft[0].end, "就是你们灭了"),
+        srt.Subtitle(2, draft[1].start, draft[1].end, "我们天灵宗，"),
+        srt.Subtitle(3, draft[2].start, draft[2].end, "今日必须付出代价！"),
+        srt.Subtitle(4, draft[3].start, draft[3].end, "不可能。"),
+    ]
+    groups = [
+        {"cue_ids": [cue.index], "full_text": cue.content, "display_texts": [cue.content]}
+        for cue in draft
+    ]
+    speech = _coalesce_speech_groups(groups, draft, source, {1: "A", 2: "A", 3: "A", 4: "A"}, set())
+    assert [item["cue_ids"] for item in speech] == [[1, 2, 3], [4]]
+    assert speech[0]["full_text"] == (
+        "Chính các người đã diệt môn phái Thiên Linh Tông chúng ta, hôm nay phải trả giá!"
+    )
+
+
+def test_speech_groups_never_cross_speakers_or_long_silence():
+    draft = [
+        srt.Subtitle(1, timedelta(seconds=0), timedelta(seconds=1), "Câu đang nói"),
+        srt.Subtitle(2, timedelta(seconds=1.1), timedelta(seconds=2), "người khác nói"),
+        srt.Subtitle(3, timedelta(seconds=4), timedelta(seconds=5), "sau khoảng nghỉ"),
+    ]
+    source = [srt.Subtitle(c.index, c.start, c.end, "还没说完") for c in draft]
+    groups = [{"cue_ids": [c.index], "full_text": c.content, "display_texts": [c.content]} for c in draft]
+    speech = _coalesce_speech_groups(groups, draft, source, {1: "A", 2: "B", 3: "B"}, {(1, 2)})
+    assert [item["cue_ids"] for item in speech] == [[1], [2], [3]]
+
+
+def test_dialogue_master_keeps_display_lines_but_tts_reads_complete_sentence():
+    draft = [
+        srt.Subtitle(1, timedelta(seconds=0), timedelta(seconds=1), "Ta vẫn chưa"),
+        srt.Subtitle(2, timedelta(seconds=1.1), timedelta(seconds=2), "nói hết câu."),
+    ]
+    source = [
+        srt.Subtitle(1, draft[0].start, draft[0].end, "我还没有"),
+        srt.Subtitle(2, draft[1].start, draft[1].end, "说完这句话。"),
+    ]
+    response = json.dumps({"utterances": [
+        {"cue_ids": [1], "full_text": "Ta vẫn chưa", "display_lines": [{"id": 1, "text": "Ta vẫn chưa"}]},
+        {"cue_ids": [2], "full_text": "nói hết câu.", "display_lines": [{"id": 2, "text": "nói hết câu."}]},
+    ]}, ensure_ascii=False)
+    display, speech, warning = build_dialogue_master(
+        draft, source, {1: "A", 2: "A"}, "deepseek", request=lambda *_: response,
+    )
+    assert warning is None
+    assert [cue.content for cue in display] == ["Ta vẫn chưa", "nói hết câu."]
+    assert len(speech) == 1
+    assert speech[0].cue_ids == [1, 2]
+    assert speech[0].full_text == "Ta vẫn chưa nói hết câu."
 
 
 def test_translation_json_parsing_and_validation():

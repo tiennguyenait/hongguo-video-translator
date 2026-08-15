@@ -85,6 +85,54 @@ def _split_at_hard_boundaries(group: dict, hard_breaks: set[tuple[int, int]]) ->
     return parts
 
 
+def _join_spoken_text(left: str, right: str, source_left: str) -> str:
+    """Remove display-cue punctuation that would create a false TTS stop."""
+    left = left.rstrip()
+    if not re.search(r"[。！？!?]\s*$", source_left.strip()):
+        left = re.sub(r"[.!?。！？]+\s*$", "", left).rstrip()
+        if re.search(r"[,，、]\s*$", source_left.strip()) and not left.endswith(","):
+            left += ","
+    return f"{left} {right.lstrip()}".strip()
+
+
+def _coalesce_speech_groups(
+    groups: list[dict], draft: list[srt.Subtitle], source: list[srt.Subtitle],
+    speakers: dict[int, str], hard_breaks: set[tuple[int, int]],
+) -> list[dict]:
+    """Build sentence-level TTS units independently from timed display lines."""
+    if not groups:
+        return []
+    draft_by_id = {cue.index: cue for cue in draft}
+    source_by_id = {cue.index: cue for cue in source}
+    result: list[dict] = []
+    current = {**groups[0], "cue_ids": list(groups[0]["cue_ids"]), "display_texts": list(groups[0]["display_texts"])}
+    for group in groups[1:]:
+        previous_id, next_id = current["cue_ids"][-1], group["cue_ids"][0]
+        previous_cue, next_cue = draft_by_id[previous_id], draft_by_id[next_id]
+        gap = (next_cue.start - previous_cue.end).total_seconds()
+        previous_speaker, next_speaker = speakers.get(previous_id), speakers.get(next_id)
+        speaker_changed = bool(previous_speaker and next_speaker and previous_speaker != next_speaker)
+        source_left = source_by_id.get(previous_id, previous_cue).content
+        source_sentence_ended = bool(re.search(r"[。！？!?][\"”’)]?\s*$", source_left.strip()))
+        first_cue = draft_by_id[current["cue_ids"][0]]
+        combined_span = (draft_by_id[group["cue_ids"][-1]].end - first_cue.start).total_seconds()
+        combined_chars = len(current["full_text"]) + len(group["full_text"])
+        can_join = (
+            (previous_id, next_id) not in hard_breaks
+            and not speaker_changed and not source_sentence_ended and gap <= 0.95
+            and combined_span <= 14.0 and combined_chars <= 220
+        )
+        if can_join:
+            current["full_text"] = _join_spoken_text(current["full_text"], group["full_text"], source_left)
+            current["cue_ids"].extend(group["cue_ids"])
+            current["display_texts"].extend(group["display_texts"])
+        else:
+            result.append(current)
+            current = {**group, "cue_ids": list(group["cue_ids"]), "display_texts": list(group["display_texts"])}
+    result.append(current)
+    return result
+
+
 def _parse_master(raw: str, expected_ids: list[int], hard_breaks: set[tuple[int, int]]) -> list[dict]:
     clean = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", raw.strip(), flags=re.I)
     payload = json.loads(clean)
@@ -175,8 +223,9 @@ def build_dialogue_master(
     }
     display = [srt.Subtitle(cue.index, cue.start, cue.end, display_mapping[cue.index]) for cue in draft]
     draft_by_id = {cue.index: cue for cue in draft}
+    speech_groups = _coalesce_speech_groups(parsed, draft, source, speakers, hard_breaks)
     utterances = []
-    for group in parsed:
+    for group in speech_groups:
         cues = [draft_by_id[item_id] for item_id in group["cue_ids"]]
         labels = [speakers[item_id] for item_id in group["cue_ids"] if item_id in speakers]
         utterances.append(MasterUtterance(
