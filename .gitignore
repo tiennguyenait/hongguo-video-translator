@@ -13,6 +13,13 @@ __pycache__/
 *.wav
 *.mp3
 
+# Authorized narrator reference required by the production TTS pipeline.
+!data/
+data/*
+!data/voices/
+data/voices/*
+!data/voices/ngoc-huyen-authorized-reference.wav
+
 # Runtime/log/editor artifacts.
 *.log
 .DS_Store
