@@ -210,7 +210,7 @@ def apply_channel_watermark(video: Path, output: Path, logo: Path, channel_name:
 def _subtitle_filter(path: Path, force_style: bool = True, fonts_dir: Path | None = None) -> str:
     escaped = str(path.resolve()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''").replace(",", "\\,")
     style = (
-        f"FontName={FONT_NAME},FontSize=11,PrimaryColour=&H00FFFFFF,"
+        f"FontName={FONT_NAME},FontSize=15,PrimaryColour=&H00FFFFFF,"
         "BackColour=&H70000000,OutlineColour=&H00000000,"
         "BorderStyle=3,Outline=1,Shadow=0,Alignment=2,MarginV=28"
     )
