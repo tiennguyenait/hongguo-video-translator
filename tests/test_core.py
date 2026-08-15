@@ -23,7 +23,7 @@ from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
 from app.source_subtitle_mask import SubtitleRegion
 from app.dialogue_master import build_dialogue_master
 from app.translator import translate_subtitles
-from app.media import AUDIO_BITRATE, VIDEO_CRF, apply_channel_watermark, concat_videos, probe_duration, probe_video_size
+from app.media import AUDIO_BITRATE, VIDEO_CRF, _merge_video_encode_args, apply_channel_watermark, concat_videos, probe_duration, probe_video_size
 from app.batching import finalize_batch_for_job, natural_filename_key
 
 
@@ -37,6 +37,16 @@ def test_srt_timestamp_conversion():
 def test_delivery_encoding_balances_size_and_compatibility():
     assert VIDEO_CRF == "23"
     assert AUDIO_BITRATE == "128k"
+
+
+def test_merge_encoding_uses_source_size_budget_and_gpu_when_available(tmp_path, monkeypatch):
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"0" * 16_000_000)
+    monkeypatch.setattr("app.media.nvenc_available", lambda: True)
+    args = _merge_video_encode_args([source], 100.0)
+    assert args[:4] == ["-c:v", "h264_nvenc", "-preset", "p5"]
+    assert args[args.index("-b:v") + 1] == "1101k"
+    assert "-maxrate" in args
 
 
 def test_default_job_keeps_source_subtitles_and_enables_vietnamese_dub():

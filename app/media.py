@@ -1,5 +1,6 @@
 import json
 import subprocess
+from functools import lru_cache
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -13,6 +14,41 @@ if TYPE_CHECKING:
 
 VIDEO_CRF = "23"
 AUDIO_BITRATE = "128k"
+
+
+@lru_cache(maxsize=1)
+def nvenc_available() -> bool:
+    """Probe the encoder itself; listing it does not guarantee a usable driver."""
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+            "color=black:s=256x256:d=0.04", "-frames:v", "1",
+            "-c:v", "h264_nvenc", "-f", "null", "-",
+        ],
+        text=True, capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _merge_video_encode_args(inputs: list[Path], duration: float) -> list[str]:
+    """Keep delivery size near the inputs while preferring hardware encoding."""
+    # Input bytes include audio. Reserve our delivery audio bitrate and a small
+    # container allowance instead of allowing quality-based encoding to grow
+    # without a ceiling after scaling or adding a watermark.
+    aggregate_kbps = sum(path.stat().st_size for path in inputs) * 8 / max(duration, 0.001) / 1000
+    target_kbps = round(max(500, min(8000, aggregate_kbps * 0.96 - 128)))
+    maximum_kbps = round(target_kbps * 1.35)
+    buffer_kbps = target_kbps * 2
+    if nvenc_available():
+        return [
+            "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+            "-rc", "vbr", "-b:v", f"{target_kbps}k", "-maxrate", f"{maximum_kbps}k",
+            "-bufsize", f"{buffer_kbps}k", "-cq", "25", "-spatial-aq", "1",
+        ]
+    return [
+        "-c:v", "libx264", "-preset", "fast", "-b:v", f"{target_kbps}k",
+        "-maxrate", f"{maximum_kbps}k", "-bufsize", f"{buffer_kbps}k",
+    ]
 
 
 def run_ffmpeg(command: list[str]) -> None:
@@ -83,7 +119,8 @@ def concat_videos(
     if not inputs:
         raise ValueError("At least one episode is required")
     signatures = [_stream_signature(path) for path in inputs]
-    branded_duration = sum(probe_duration(path) for path in inputs) if logo and channel_name else None
+    total_duration = sum(probe_duration(path) for path in inputs)
+    branded_duration = total_duration if logo and channel_name else None
     matching = all(signature == signatures[0] for signature in signatures[1:])
     if matching:
         manifest = output.parent / "concat-files.txt"
@@ -101,7 +138,7 @@ def concat_videos(
         run_ffmpeg([
             "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(manifest),
             "-loop", "1", "-i", str(logo), "-filter_complex_script", str(script),
-            "-map", "[outv]", "-map", "0:a:0", "-c:v", "libx264", "-preset", "medium", "-crf", VIDEO_CRF,
+            "-map", "[outv]", "-map", "0:a:0", *_merge_video_encode_args(inputs, total_duration),
             "-c:a", "copy", "-t", f"{branded_duration:.6f}", "-movflags", "+faststart", str(output),
         ])
         return
@@ -128,7 +165,7 @@ def concat_videos(
     script.write_text(";\n".join(filters), encoding="utf-8")
     command += [
         "-filter_complex_script", str(script), "-map", "[outv]", "-map", "[outa]",
-        "-c:v", "libx264", "-preset", "medium", "-crf", VIDEO_CRF,
+        *_merge_video_encode_args(inputs, total_duration),
         "-c:a", "aac", "-b:a", AUDIO_BITRATE,
     ]
     if branded_duration is not None:
