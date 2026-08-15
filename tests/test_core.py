@@ -45,9 +45,10 @@ def test_merge_encoding_uses_source_size_budget_and_gpu_when_available(tmp_path,
     source.write_bytes(b"0" * 16_000_000)
     monkeypatch.setattr("app.media.nvenc_available", lambda: True)
     args = _merge_video_encode_args([source], 100.0)
-    assert args[:4] == ["-c:v", "h264_nvenc", "-preset", "p5"]
-    assert args[args.index("-b:v") + 1] == "1306k"
-    assert args[args.index("-maxrate") + 1] == "1472k"
+    assert args[:4] == ["-c:v", "h264_nvenc", "-preset", "p6"]
+    assert args[args.index("-b:v") + 1] == "4200k"
+    assert args[args.index("-maxrate") + 1] == "6300k"
+    assert args[args.index("-cq") + 1] == "18"
     assert "-maxrate" in args
 
 

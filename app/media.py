@@ -30,26 +30,26 @@ def nvenc_available() -> bool:
     return result.returncode == 0
 
 
-def _merge_video_encode_args(inputs: list[Path], duration: float) -> list[str]:
-    """Keep delivery size near the inputs while preferring hardware encoding."""
-    # Input bytes include audio. Reserve our delivery audio bitrate and a small
-    # container allowance instead of allowing quality-based encoding to grow
-    # without a ceiling after scaling or adding a watermark.
+def _merge_video_encode_args(
+    inputs: list[Path], duration: float, width: int = 1920, height: int = 1080,
+) -> list[str]:
+    """Prefer visually loss-resistant delivery over matching compressed input size."""
     aggregate_kbps = sum(path.stat().st_size for path in inputs) * 8 / max(duration, 0.001) / 1000
-    # Aim for ~112% of the aggregate input size, leaving enough headroom for
-    # scaling mixed-resolution episodes without permitting the old 2x growth.
-    # The VBV ceiling corresponds to ~125% of the aggregate delivery bitrate.
-    target_kbps = round(max(500, min(8000, aggregate_kbps * 1.12 - 128)))
-    maximum_kbps = round(max(target_kbps, min(10000, aggregate_kbps * 1.25 - 128)))
+    # Most Hongguo inputs are efficient low-bitrate HEVC. Converting those to
+    # H.264 at a similar byte budget visibly removes texture. Use the sharper
+    # of a codec-conversion multiplier and a resolution-aware quality floor.
+    quality_floor = 4200 * (max(1, width * height) / (1920 * 1080))
+    target_kbps = round(max(650, min(12000, max(aggregate_kbps * 2.4 - 128, quality_floor))))
+    maximum_kbps = round(min(18000, target_kbps * 1.5))
     buffer_kbps = target_kbps * 2
     if nvenc_available():
         return [
-            "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+            "-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq",
             "-rc", "vbr", "-b:v", f"{target_kbps}k", "-maxrate", f"{maximum_kbps}k",
-            "-bufsize", f"{buffer_kbps}k", "-cq", "25", "-spatial-aq", "1",
+            "-bufsize", f"{buffer_kbps}k", "-cq", "18", "-spatial-aq", "1",
         ]
     return [
-        "-c:v", "libx264", "-preset", "fast", "-b:v", f"{target_kbps}k",
+        "-c:v", "libx264", "-preset", "medium", "-b:v", f"{target_kbps}k",
         "-maxrate", f"{maximum_kbps}k", "-bufsize", f"{buffer_kbps}k",
     ]
 
@@ -141,7 +141,7 @@ def concat_videos(
         run_ffmpeg([
             "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(manifest),
             "-loop", "1", "-i", str(logo), "-filter_complex_script", str(script),
-            "-map", "[outv]", "-map", "0:a:0", *_merge_video_encode_args(inputs, total_duration),
+            "-map", "[outv]", "-map", "0:a:0", *_merge_video_encode_args(inputs, total_duration, width, height),
             "-c:a", "copy", "-t", f"{branded_duration:.6f}", "-movflags", "+faststart", str(output),
         ])
         return
@@ -168,7 +168,7 @@ def concat_videos(
     script.write_text(";\n".join(filters), encoding="utf-8")
     command += [
         "-filter_complex_script", str(script), "-map", "[outv]", "-map", "[outa]",
-        *_merge_video_encode_args(inputs, total_duration),
+        *_merge_video_encode_args(inputs, total_duration, width, height),
         "-c:a", "aac", "-b:a", AUDIO_BITRATE,
     ]
     if branded_duration is not None:
