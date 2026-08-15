@@ -24,7 +24,7 @@ from app.source_subtitle_mask import SubtitleRegion
 from app.dialogue_master import build_dialogue_master
 from app.translator import translate_subtitles
 from app.media import AUDIO_BITRATE, VIDEO_CRF, _merge_video_encode_args, apply_channel_watermark, concat_videos, probe_duration, probe_video_size
-from app.batching import finalize_batch_for_job, natural_filename_key
+from app.batching import _unique_output_filename, finalize_batch_for_job, natural_filename_key
 
 
 def test_srt_timestamp_conversion():
@@ -45,8 +45,19 @@ def test_merge_encoding_uses_source_size_budget_and_gpu_when_available(tmp_path,
     monkeypatch.setattr("app.media.nvenc_available", lambda: True)
     args = _merge_video_encode_args([source], 100.0)
     assert args[:4] == ["-c:v", "h264_nvenc", "-preset", "p5"]
-    assert args[args.index("-b:v") + 1] == "1101k"
+    assert args[args.index("-b:v") + 1] == "1306k"
+    assert args[args.index("-maxrate") + 1] == "1472k"
     assert "-maxrate" in args
+
+
+def test_batch_output_filename_is_timestamped_and_safe():
+    batch = {"created_at": "2026-08-15T03:48:50+00:00", "dub": 1, "burn_subtitles": 1}
+    assert _unique_output_filename(batch, [{"filename": "Tập 01: mở đầu.mp4"}]) == (
+        "20260815-034850_Tập 01- mở đầu.mp4"
+    )
+    assert _unique_output_filename(batch, [{"filename": "1.mp4"}, {"filename": "2.mp4"}]) == (
+        "20260815-034850_combined-vi-dubbed.mp4"
+    )
 
 
 def test_default_job_keeps_source_subtitles_and_enables_vietnamese_dub():

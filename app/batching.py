@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -85,6 +86,24 @@ def combined_filename(batch: dict[str, Any]) -> str:
     return "combined-source.mp4"
 
 
+def _unique_output_filename(batch: dict[str, Any], episodes: list[dict[str, Any]]) -> str:
+    """Build a stable, human-readable name without trusting an uploaded path."""
+    try:
+        stamp = datetime.fromisoformat(str(batch["created_at"])).strftime("%Y%m%d-%H%M%S")
+    except (KeyError, TypeError, ValueError):
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if len(episodes) == 1:
+        label = Path(str(episodes[0].get("filename") or "video")).stem
+    elif batch["dub"]:
+        label = "combined-vi-dubbed"
+    elif batch["burn_subtitles"]:
+        label = "combined-vi-burned"
+    else:
+        label = "combined-source"
+    label = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", label).strip(" .-") or "video"
+    return f"{stamp}_{label}.mp4"
+
+
 def finalize_batch_for_job(job_id: str) -> None:
     batch_id = get_job_batch(job_id)
     if not batch_id:
@@ -126,11 +145,16 @@ def finalize_batch_for_job(job_id: str) -> None:
             error=None,
         )
         return
-    update_batch(batch_id, status="combining", progress_message=f"Combining {len(episodes)} translated episodes", error=None)
+    output_name = str(batch.get("output_filename") or _unique_output_filename(batch, episodes))
+    update_batch(
+        batch_id, status="combining", output_filename=output_name,
+        progress_message=f"Combining {len(episodes)} translated episodes", error=None,
+    )
+    batch["output_filename"] = output_name
     source_name = "vi-dubbed.mp4" if batch["dub"] else "vi-burned.mp4" if batch["burn_subtitles"] else "source.mp4"
     inputs = [get_settings().jobs_dir / item["id"] / source_name for item in episodes]
     directory = batch_directory(batch_id)
-    output = directory / combined_filename(batch)
+    output = directory / output_name
     try:
         logo = directory / "logo.png"
         branded = bool(batch.get("channel_name") and logo.is_file())

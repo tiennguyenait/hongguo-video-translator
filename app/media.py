@@ -36,8 +36,11 @@ def _merge_video_encode_args(inputs: list[Path], duration: float) -> list[str]:
     # container allowance instead of allowing quality-based encoding to grow
     # without a ceiling after scaling or adding a watermark.
     aggregate_kbps = sum(path.stat().st_size for path in inputs) * 8 / max(duration, 0.001) / 1000
-    target_kbps = round(max(500, min(8000, aggregate_kbps * 0.96 - 128)))
-    maximum_kbps = round(target_kbps * 1.35)
+    # Aim for ~112% of the aggregate input size, leaving enough headroom for
+    # scaling mixed-resolution episodes without permitting the old 2x growth.
+    # The VBV ceiling corresponds to ~125% of the aggregate delivery bitrate.
+    target_kbps = round(max(500, min(8000, aggregate_kbps * 1.12 - 128)))
+    maximum_kbps = round(max(target_kbps, min(10000, aggregate_kbps * 1.25 - 128)))
     buffer_kbps = target_kbps * 2
     if nvenc_available():
         return [
