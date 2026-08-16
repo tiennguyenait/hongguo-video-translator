@@ -191,12 +191,24 @@ def translate_subtitles(
                         "Shorten these lines. Natural Vietnamese is more important than literal wording. "
                         "Return the same ids:\n" + json.dumps(shorten_items, ensure_ascii=False)
                     )
-                    shortened_raw = (
-                        _gemini(SHORTEN_SYSTEM_PROMPT, shorten_prompt)
-                        if provider == "gemini"
-                        else _openai_compatible(provider, SHORTEN_SYSTEM_PROMPT, shorten_prompt)
-                    )
-                    mapping.update(parse_translation_json(shortened_raw, overlong))
+                    try:
+                        shortened_raw = (
+                            _gemini(SHORTEN_SYSTEM_PROMPT, shorten_prompt)
+                            if provider == "gemini"
+                            else _openai_compatible(provider, SHORTEN_SYSTEM_PROMPT, shorten_prompt)
+                        )
+                        mapping.update(parse_translation_json(shortened_raw, overlong))
+                    except (ValueError, requests.RequestException) as exc:
+                        # Shortening is an optional timing optimization. The main
+                        # translation above is already valid, so a malformed or
+                        # transient shortening response must not fail the episode.
+                        # Dialogue reflow and TTS fitting have the full sentence
+                        # context and can safely handle the original wording.
+                        if progress:
+                            progress(
+                                "Provider shortening was unusable; retaining the "
+                                f"validated translation for dialogue timing: {exc}"
+                            )
                     overlong = [item_id for item_id in overlong if len(mapping[item_id].split()) > limits[item_id] + 2]
                 if target_language.lower().startswith("vietnam") and overlong:
                     # A short ASR cue is often only the tail of a sentence. Failing the

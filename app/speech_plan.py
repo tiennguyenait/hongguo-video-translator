@@ -47,6 +47,21 @@ def infer_emotion(text: str) -> str:
     return "neutral"
 
 
+def punctuation_pause_after_ms(text: str) -> int:
+    ending = text.rstrip()
+    if re.search(r"(?:\.{2,}|…+)$", ending):
+        return 360
+    if re.search(r"\.[\"”’)]?$", ending):
+        return 360
+    if re.search(r"[!?][\"”’)]?$", ending):
+        return 320
+    if re.search(r"[;:][\"”’)]?$", ending):
+        return 240
+    if re.search(r",[\"”’)]?$", ending):
+        return 180
+    return 100
+
+
 def build_speech_plans(utterances: list[tuple[srt.Subtitle, str | None]], video_duration_ms: int) -> list[SpeechPlan]:
     plans: list[SpeechPlan] = []
     for index, (cue, _) in enumerate(utterances):
@@ -60,5 +75,6 @@ def build_speech_plans(utterances: list[tuple[srt.Subtitle, str | None]], video_
             id=cue.index, subtitle_text=cue.content, spoken_text=spoken, start_ms=start_ms,
             target_duration_ms=target_ms, hard_deadline_ms=hard_ms, predicted_duration_ms=predicted,
             emotion=infer_emotion(cue.content), pace=min(1.18, max(0.92, predicted / max(1, target_ms))),
+            pause_after_ms=punctuation_pause_after_ms(spoken),
         ))
     return plans

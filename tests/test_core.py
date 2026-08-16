@@ -16,7 +16,7 @@ from app.speech_pipeline import _group_words
 from app.tts import _fit_audio_to_window, build_utterances
 from app.artifacts import ArtifactManifest, stable_hash
 from app.dialogue import build_dialogue_units, repair_fragment_speakers
-from app.speech_plan import build_speech_plans, predict_duration_ms
+from app.speech_plan import build_speech_plans, predict_duration_ms, punctuation_pause_after_ms
 from app.prosody import apply_ai_prosody, plan_prosody
 from app.text_normalizer import normalize_spoken_text, vietnamese_integer
 from app.source_subtitle_mask import _candidate_boxes
@@ -26,6 +26,7 @@ from app.dialogue_master import _coalesce_speech_groups, build_dialogue_master
 from app.translator import translate_subtitles
 from app.media import AUDIO_BITRATE, VIDEO_CRF, _merge_video_encode_args, apply_channel_watermark, concat_videos, probe_duration, probe_video_size
 from app.batching import _unique_output_filename, finalize_batch_for_job, natural_filename_key
+from scripts.vieneu_batch import split_for_natural_pauses
 
 
 def test_srt_timestamp_conversion():
@@ -33,6 +34,23 @@ def test_srt_timestamp_conversion():
     assert cues[0].start == timedelta(milliseconds=1234)
     assert cues[0].end == timedelta(milliseconds=3457)
     assert cues[0].content == "hello"
+
+
+def test_vieneu_pauses_follow_vietnamese_punctuation():
+    assert split_for_natural_pauses("Chờ một chút, rồi đi tiếp. Được không? Đi thôi!") == [
+        ("Chờ một chút,", 180),
+        ("rồi đi tiếp.", 360),
+        ("Được không?", 320),
+        ("Đi thôi!", 320),
+    ]
+
+
+def test_pause_between_spoken_lines_follows_terminal_punctuation():
+    assert punctuation_pause_after_ms("Hết câu.") == 360
+    assert punctuation_pause_after_ms("Chờ đã,") == 180
+    assert punctuation_pause_after_ms("Nghỉ vừa;") == 240
+    assert punctuation_pause_after_ms("Có thật không?") == 320
+    assert punctuation_pause_after_ms("Nói tiếp") == 100
 
 
 def test_delivery_encoding_balances_size_and_compatibility():
@@ -252,6 +270,23 @@ def test_translation_over_budget_is_deferred_to_dialogue_timing(monkeypatch, tmp
     assert translated[0].content.startswith("Trưởng lão")
     assert len(responses) == 2  # initial translation plus one shortening attempt
     assert any("dialogue reflow" in message for message in messages)
+
+
+def test_malformed_optional_shortening_keeps_valid_translation(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"translation_scene_review": False})
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    responses = iter([
+        '{"translations":[{"id":10,"text":"Trưởng lão đã chú ý, tuyệt đối không được đắc tội."}]}',
+        '{"translations":[{"translation":"Không có id nên không hợp lệ"}]}',
+    ])
+    monkeypatch.setattr("app.translator._openai_compatible", lambda *_: next(responses))
+    cue = srt.Subtitle(10, timedelta(0), timedelta(seconds=1.421), "老已经看中我万不可得罪")
+    messages = []
+    translated = translate_subtitles(
+        [cue], "deepseek", "Chinese", "Vietnamese", progress=messages.append, job_dir=tmp_path,
+    )
+    assert translated[0].content == "Trưởng lão đã chú ý, tuyệt đối không được đắc tội."
+    assert any("shortening was unusable" in message for message in messages)
 
 
 def test_translation_recovers_only_ids_omitted_by_provider(monkeypatch, tmp_path):

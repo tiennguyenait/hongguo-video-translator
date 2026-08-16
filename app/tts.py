@@ -13,7 +13,7 @@ from .media import mux_delayed_clips, probe_duration
 from .config import get_settings
 from .voice_profiles import classify_speaker_voices
 from .artifacts import atomic_write_json, stable_hash
-from .speech_plan import build_speech_plans
+from .speech_plan import build_speech_plans, punctuation_pause_after_ms
 from .prosody import PROSODY_VERSION, plan_prosody
 
 MAX_NATURAL_TEMPO = 1.35
@@ -118,7 +118,7 @@ def _synthesize_local_batch(items: list[dict], voice: str, clips_dir: Path) -> N
     missing: list[dict] = []
     for item in items:
         key = stable_hash({"text": item["text"], "style": item.get("style", "doc_truyen"), "voice": voice,
-                           "reference": reference_stamp, "engine": "vieneu-v3-turbo", "prosody": PROSODY_VERSION})
+                           "reference": reference_stamp, "engine": "vieneu-v3-turbo-pause-v1", "prosody": PROSODY_VERSION})
         cache_keys[item["id"]] = key
         cached = settings.tts_cache_dir / f"{key}.wav"
         output = clips_dir / f"{item['id']:06d}.wav"
@@ -188,6 +188,10 @@ def create_dub(
     prosody_warning = None
     if narrator_mode:
         plans, prosody_warning = plan_prosody(plans, provider)
+    for plan in plans:
+        # Provider direction may add a longer dramatic pause, but it must not
+        # erase the deterministic breathing room required by terminal punctuation.
+        plan.pause_after_ms = max(plan.pause_after_ms, punctuation_pause_after_ms(plan.spoken_text))
     atomic_write_json(job_dir / "prosody-plan.json", {
         "version": PROSODY_VERSION, "warning": prosody_warning,
         "items": [plan.to_dict() for plan in plans],
@@ -199,6 +203,7 @@ def create_dub(
     fitted_dir.mkdir(exist_ok=True)
     delayed_clips: list[tuple[Path, int]] = []
     timing_report: list[dict] = []
+    timeline_cursor_ms = 0
     for number, (cue, speaker) in enumerate(utterances, 1):
         plan = plans[number - 1]
         clip_path = clips_dir / f"{cue.index:06d}.{'wav' if narrator_mode else 'mp3'}"
@@ -211,13 +216,17 @@ def create_dub(
         audio = _fit_audio_to_window(audio, target_window, clip_path)
         fitted_path = fitted_dir / f"{cue.index:06d}.wav"
         audio.set_frame_rate(48000).set_channels(1).set_sample_width(2).export(fitted_path, format="wav")
-        delayed_clips.append((fitted_path, plan.start_ms + plan.pause_before_ms))
+        scheduled_start_ms = max(plan.start_ms + plan.pause_before_ms, timeline_cursor_ms)
+        delayed_clips.append((fitted_path, scheduled_start_ms))
+        timeline_cursor_ms = scheduled_start_ms + len(audio) + plan.pause_after_ms
         timing_report.append({
             "id": plan.id, "predicted_ms": plan.predicted_duration_ms, "original_ms": original_ms,
             "fitted_ms": len(audio), "target_ms": plan.target_duration_ms, "hard_deadline_ms": plan.hard_deadline_ms,
             "tempo": round(original_ms / max(1, len(audio)), 4), "overflow_ms": max(0, len(audio) - plan.hard_deadline_ms),
             "emotion": plan.emotion, "intensity": plan.intensity, "style": plan.style,
             "pause_before_ms": plan.pause_before_ms, "pause_after_ms": plan.pause_after_ms,
+            "source_start_ms": plan.start_ms, "scheduled_start_ms": scheduled_start_ms,
+            "schedule_shift_ms": scheduled_start_ms - plan.start_ms,
         })
         if progress and (number == len(utterances) or number % 5 == 0):
             progress(f"Synthesized {number}/{len(utterances)} natural utterances")
