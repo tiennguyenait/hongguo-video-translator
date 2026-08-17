@@ -8,6 +8,7 @@ from pathlib import Path
 import edge_tts
 import srt
 from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
 
 from .media import mux_delayed_clips, probe_duration
 from .config import get_settings
@@ -16,7 +17,27 @@ from .artifacts import atomic_write_json, stable_hash
 from .speech_plan import build_speech_plans, punctuation_pause_after_ms
 from .prosody import PROSODY_VERSION, plan_prosody
 
-MAX_NATURAL_TEMPO = 1.35
+MAX_NATURAL_TEMPO = 1.18
+
+
+def _trim_edge_silence(audio: AudioSegment) -> AudioSegment:
+    """Remove only long silent padding added by TTS, preserving natural breaths."""
+    if not audio or audio.dBFS == float("-inf"):
+        return audio
+    ranges = detect_nonsilent(
+        audio, min_silence_len=120, silence_thresh=max(-48.0, audio.dBFS - 28.0), seek_step=5,
+    )
+    if not ranges:
+        return audio
+    start = max(0, ranges[0][0] - 40)
+    end = min(len(audio), ranges[-1][1] + 60)
+    return audio[start:end]
+
+
+def _available_speech_window_ms(plan) -> int:
+    """Use real silence before the next utterance while reserving punctuation pauses."""
+    deadline_window = plan.hard_deadline_ms - plan.pause_before_ms - plan.pause_after_ms
+    return max(plan.target_duration_ms, deadline_window)
 
 
 def _fit_audio_to_window(audio: AudioSegment, target_ms: int, work_path: Path) -> AudioSegment:
@@ -211,8 +232,11 @@ def create_dub(
         if not narrator_mode:
             asyncio.run(_synthesize(cue, cue_voice, clip_path, narrator_mode))
         audio = AudioSegment.from_file(clip_path)
+        raw_original_ms = len(audio)
+        audio = _trim_edge_silence(audio)
         original_ms = len(audio)
-        target_window = max(plan.target_duration_ms, min(plan.hard_deadline_ms, round(plan.target_duration_ms * 1.18)))
+        target_window = _available_speech_window_ms(plan)
+        required_tempo = original_ms / max(1, target_window)
         audio = _fit_audio_to_window(audio, target_window, clip_path)
         fitted_path = fitted_dir / f"{cue.index:06d}.wav"
         audio.set_frame_rate(48000).set_channels(1).set_sample_width(2).export(fitted_path, format="wav")
@@ -220,9 +244,12 @@ def create_dub(
         delayed_clips.append((fitted_path, scheduled_start_ms))
         timeline_cursor_ms = scheduled_start_ms + len(audio) + plan.pause_after_ms
         timing_report.append({
-            "id": plan.id, "predicted_ms": plan.predicted_duration_ms, "original_ms": original_ms,
+            "id": plan.id, "predicted_ms": plan.predicted_duration_ms, "raw_original_ms": raw_original_ms,
+            "original_ms": original_ms,
             "fitted_ms": len(audio), "target_ms": plan.target_duration_ms, "hard_deadline_ms": plan.hard_deadline_ms,
-            "tempo": round(original_ms / max(1, len(audio)), 4), "overflow_ms": max(0, len(audio) - plan.hard_deadline_ms),
+            "available_window_ms": target_window, "required_tempo": round(required_tempo, 4),
+            "tempo": round(original_ms / max(1, len(audio)), 4),
+            "overflow_ms": max(0, scheduled_start_ms + len(audio) - (plan.start_ms + plan.hard_deadline_ms)),
             "emotion": plan.emotion, "intensity": plan.intensity, "style": plan.style,
             "pause_before_ms": plan.pause_before_ms, "pause_after_ms": plan.pause_after_ms,
             "source_start_ms": plan.start_ms, "scheduled_start_ms": scheduled_start_ms,

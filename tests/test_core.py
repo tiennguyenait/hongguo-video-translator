@@ -13,7 +13,7 @@ from app.jobs import JobWorker, apply_subtitle_review, safe_job_file
 from app.schemas import JobCreate
 from app.subtitle import parse_translation_json, segments_to_subtitles
 from app.speech_pipeline import _catastrophically_sparse, _group_words, _transcript_metrics
-from app.tts import _fit_audio_to_window, build_utterances
+from app.tts import _available_speech_window_ms, _fit_audio_to_window, _trim_edge_silence, build_utterances
 from app.artifacts import ArtifactManifest, stable_hash
 from app.dialogue import build_dialogue_units, repair_fragment_speakers
 from app.speech_plan import build_speech_plans, predict_duration_ms, punctuation_pause_after_ms
@@ -471,7 +471,9 @@ def test_tts_audio_is_fitted_close_to_speech_window(tmp_path):
     from pydub import AudioSegment
     original = AudioSegment.silent(duration=2000, frame_rate=44100)
     fitted = _fit_audio_to_window(original, 1600, tmp_path / "cue.mp3")
-    assert abs(len(fitted) - 1600) < 80
+    # Natural speech is never accelerated beyond 1.18x, even when the visual
+    # window would require a harsher 1.25x stretch.
+    assert 1650 <= len(fitted) <= 1750
 
 
 def test_tts_audio_is_never_slow_stretched(tmp_path):
@@ -479,6 +481,22 @@ def test_tts_audio_is_never_slow_stretched(tmp_path):
     original = AudioSegment.silent(duration=1200, frame_rate=44100)
     fitted = _fit_audio_to_window(original, 2000, tmp_path / "cue.mp3")
     assert len(fitted) == 1200
+
+
+def test_tts_uses_silence_before_next_utterance():
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "Xin chào.")
+    plan = build_speech_plans([(cue, "A")], 5000)[0]
+    assert plan.target_duration_ms == 2000
+    assert plan.hard_deadline_ms == 5000
+    assert _available_speech_window_ms(plan) == 4640
+
+
+def test_tts_trims_only_edge_padding():
+    from pydub import AudioSegment
+    from pydub.generators import Sine
+    audio = AudioSegment.silent(300) + Sine(440).to_audio_segment(duration=700) + AudioSegment.silent(400)
+    trimmed = _trim_edge_silence(audio)
+    assert 760 <= len(trimmed) <= 830
 
 
 def test_utterances_stop_at_complete_sentence():
