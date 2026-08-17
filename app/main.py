@@ -11,7 +11,7 @@ from . import batching
 from .database import delete_job, get_batch, get_batch_jobs, get_job, init_db, list_jobs, recover_interrupted_jobs, update_batch
 from .jobs import apply_subtitle_review, job_directory, remove_job_files, safe_job_file, serialize_job, worker
 from .models import JobStatus
-from .schemas import BatchResponse, JobCreate, JobResponse, JobReview
+from .schemas import BatchDownloadAck, BatchResponse, JobCreate, JobResponse, JobReview
 from .subtitle import read_srt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -22,6 +22,7 @@ async def lifespan(_: FastAPI):
     init_db()
     recover_interrupted_jobs()
     worker.start()
+    batching.start_batch_recovery_monitor()
     yield
     worker.stop()
 
@@ -45,6 +46,9 @@ def serialize_batch(row: dict) -> dict:
             if row["status"] == "done" and output_path.is_file()
             else None
         ),
+        "download_confirmed_at": row.get("download_confirmed_at"),
+        "download_confirmed_bytes": row.get("download_confirmed_bytes"),
+        "eligible_for_cleanup": bool(row.get("download_confirmed_at") and row["status"] == "done"),
         "episodes": [
             {"position": item["position"], "filename": item["filename"], "job": serialize_job(item)}
             for item in episodes
@@ -77,18 +81,25 @@ def cloned_voice_demo():
 
 @app.post("/api/jobs", response_model=JobResponse, status_code=201)
 def create_job(request: JobCreate):
+    try:
+        batching.require_upload_capacity()
+    except batching.InsufficientStorageError as exc:
+        raise HTTPException(507, str(exc)) from exc
     return serialize_job(worker.submit(request))
 
 
 @app.post("/api/jobs/upload", response_model=JobResponse, status_code=201)
 def create_upload_job(video: UploadFile = File(...), options: str = Form("{}")):
     try:
+        batching.require_upload_capacity(int(video.size or 0))
         payload = json.loads(options)
         if not isinstance(payload, dict):
             raise ValueError("Upload options must be a JSON object")
         payload.pop("url", None)
         request = JobCreate(url="https://upload.local/source.mp4", **payload)
         return serialize_job(worker.submit_upload(request, video.filename or "video.mp4", video.file))
+    except batching.InsufficientStorageError as exc:
+        raise HTTPException(507, str(exc)) from exc
     except (json.JSONDecodeError, ValidationError, ValueError) as exc:
         message = str(exc)
         status = 413 if "5 GiB" in message else 400
@@ -108,6 +119,7 @@ def create_folder_upload(
         raise HTTPException(400, "Select between 1 and 200 MP4 files")
     batch = None
     try:
+        batching.require_upload_capacity(sum(int(video.size or 0) for video in mp4_videos))
         payload = json.loads(options)
         if not isinstance(payload, dict):
             raise ValueError("Upload options must be a JSON object")
@@ -134,6 +146,8 @@ def create_folder_upload(
         update_batch(batch["id"], status="queued", progress_message=f"Queued {len(ordered)} episodes in filename order", error=None)
         batching.finalize_batch_for_job(row["id"])
         return serialize_batch(get_batch(batch["id"]))
+    except batching.InsufficientStorageError as exc:
+        raise HTTPException(507, str(exc)) from exc
     except (json.JSONDecodeError, ValidationError, ValueError) as exc:
         if batch:
             update_batch(batch["id"], status="failed", progress_message="Folder upload failed", error=str(exc))
@@ -155,6 +169,7 @@ def start_chunked_batch(
         raise HTTPException(400, "Expected episode count must be between 1 and 200")
     batch = None
     try:
+        batching.require_upload_capacity()
         payload = json.loads(options)
         if not isinstance(payload, dict):
             raise ValueError("Upload options must be a JSON object")
@@ -172,6 +187,8 @@ def start_chunked_batch(
         if logo and logo.filename:
             batching.save_batch_logo(batch["id"], logo.file)
         return serialize_batch(get_batch(batch["id"]))
+    except batching.InsufficientStorageError as exc:
+        raise HTTPException(507, str(exc)) from exc
     except (json.JSONDecodeError, ValidationError, ValueError) as exc:
         if batch:
             update_batch(batch["id"], status="failed", progress_message="Batch setup failed", error=str(exc))
@@ -192,6 +209,7 @@ def upload_batch_chunk(
     if batch["status"] != "uploading":
         raise HTTPException(409, "Batch is no longer accepting uploads")
     try:
+        batching.require_upload_capacity(sum(int(video.size or 0) for video in videos))
         requested_positions = json.loads(positions)
         if (not isinstance(requested_positions, list) or len(requested_positions) != len(videos)
                 or not all(isinstance(item, int) for item in requested_positions)):
@@ -218,6 +236,8 @@ def upload_batch_chunk(
         uploaded = len(get_batch_jobs(batch_id))
         update_batch(batch_id, progress_message=f"Uploaded {uploaded}/{expected} episodes in resumable chunks", error=None)
         return serialize_batch(get_batch(batch_id))
+    except batching.InsufficientStorageError as exc:
+        raise HTTPException(507, str(exc)) from exc
     except (json.JSONDecodeError, ValidationError, ValueError) as exc:
         raise HTTPException(413 if "5 GiB" in str(exc) else 400, str(exc)) from exc
     finally:
@@ -261,6 +281,30 @@ def batch_file(batch_id: str, filename: str):
     if not path.is_file():
         raise HTTPException(404, "Combined video is not ready")
     return FileResponse(path, filename=filename, media_type="video/mp4")
+
+
+@app.post("/api/batches/{batch_id}/download-complete", response_model=BatchResponse)
+def confirm_batch_download(batch_id: str, request: BatchDownloadAck):
+    row = get_batch(batch_id)
+    if not row:
+        raise HTTPException(404, "Batch not found")
+    if row["status"] != "done":
+        raise HTTPException(409, "Batch output is not finalized")
+    filename = batching.combined_filename(row)
+    path = batching.batch_directory(batch_id) / filename
+    if not path.is_file():
+        raise HTTPException(404, "Combined video is not ready")
+    actual_size = path.stat().st_size
+    if request.size_bytes != actual_size:
+        raise HTTPException(409, f"Downloaded size mismatch: local={request.size_bytes}, server={actual_size}")
+    from .database import utc_now
+    update_batch(batch_id, download_confirmed_at=utc_now(), download_confirmed_bytes=actual_size)
+    return serialize_batch(get_batch(batch_id))
+
+
+@app.get("/api/storage")
+def storage_detail():
+    return batching.storage_status()
 
 
 @app.get("/api/jobs", response_model=list[JobResponse])

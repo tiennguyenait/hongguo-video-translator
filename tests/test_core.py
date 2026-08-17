@@ -26,6 +26,7 @@ from app.dialogue_master import _coalesce_speech_groups, build_dialogue_master
 from app.translator import translate_subtitles
 from app.media import AUDIO_BITRATE, VIDEO_CRF, _merge_video_encode_args, apply_channel_watermark, concat_videos, probe_duration, probe_video_size
 from app.batching import _unique_output_filename, finalize_batch_for_job, natural_filename_key
+import app.batching as batching
 from scripts.vieneu_batch import split_for_natural_pauses
 
 
@@ -119,6 +120,83 @@ def test_batch_keeps_running_after_one_episode_fails(monkeypatch):
     assert updates[-1][1]["status"] == "running"
     assert "continuing" in updates[-1][1]["progress_message"]
     assert "tap-1.mp4" in updates[-1][1]["error"]
+
+
+def test_storage_guard_rejects_upload_below_reserve(monkeypatch, tmp_path):
+    settings = SimpleNamespace(
+        data_dir=tmp_path, storage_warning_bytes=150, storage_reserve_bytes=80,
+        combine_size_multiplier=3.2,
+    )
+    monkeypatch.setattr(batching, "get_settings", lambda: settings)
+    monkeypatch.setattr(batching.shutil, "disk_usage", lambda _: SimpleNamespace(total=1000, used=940, free=60))
+    status = batching.storage_status()
+    assert status["warning"] is True
+    assert status["accepting_uploads"] is False
+    with pytest.raises(batching.InsufficientStorageError, match="Insufficient server storage"):
+        batching.require_upload_capacity()
+
+
+def test_combine_waits_for_estimated_output_and_reserve(monkeypatch, tmp_path):
+    job_id, batch_id = "job-1", "batch-1"
+    jobs_dir, data_dir = tmp_path / "jobs", tmp_path / "data"
+    source = jobs_dir / job_id / "vi-dubbed.mp4"
+    source.parent.mkdir(parents=True); source.write_bytes(b"x" * 100)
+    (data_dir / "batches" / batch_id).mkdir(parents=True)
+    settings = SimpleNamespace(
+        jobs_dir=jobs_dir, data_dir=data_dir, storage_reserve_bytes=100,
+        combine_size_multiplier=3.0,
+    )
+    updates = []
+    monkeypatch.setattr(batching, "get_settings", lambda: settings)
+    monkeypatch.setattr(batching, "get_job_batch", lambda _: batch_id)
+    monkeypatch.setattr(batching, "get_batch", lambda _: {
+        "id": batch_id, "status": "running", "dub": 1, "burn_subtitles": 1,
+        "output_filename": "", "created_at": "2026-01-01T00:00:00+00:00",
+    })
+    monkeypatch.setattr(batching, "get_batch_jobs", lambda _: [
+        {"id": job_id, "position": 1, "filename": "tap-1.mp4", "status": "done"},
+    ])
+    monkeypatch.setattr(batching, "storage_status", lambda: {"free_bytes": 350})
+    monkeypatch.setattr(batching, "update_batch", lambda batch, **values: updates.append((batch, values)))
+    batching._active_combines.clear()
+    finalize_batch_for_job(job_id)
+    assert updates[-1][1]["status"] == "waiting_for_space"
+    assert "400.0" not in updates[-1][1]["progress_message"]  # message is presented in GiB
+    assert batch_id not in batching._active_combines
+
+
+def test_recovery_retries_interrupted_combines(monkeypatch):
+    calls = []
+    monkeypatch.setattr(batching, "list_batches_by_status", lambda statuses: [
+        {"id": "batch-1", "status": "combining"},
+        {"id": "batch-2", "status": "waiting_for_space"},
+    ])
+    monkeypatch.setattr(batching, "get_batch_jobs", lambda batch_id: [{"id": f"job-{batch_id}"}])
+    monkeypatch.setattr(batching, "finalize_batch_for_job", calls.append)
+    batching.recover_interrupted_batches()
+    assert calls == ["job-batch-1", "job-batch-2"]
+
+
+def test_download_ack_requires_exact_output_size(monkeypatch, tmp_path):
+    import app.main as main
+    from app.schemas import BatchDownloadAck
+    from fastapi import HTTPException
+
+    output = tmp_path / "combined.mp4"
+    output.write_bytes(b"complete-video")
+    row = {"id": "batch-1", "status": "done", "output_filename": output.name}
+    updates = []
+    monkeypatch.setattr(main, "get_batch", lambda _: row)
+    monkeypatch.setattr(main.batching, "combined_filename", lambda _: output.name)
+    monkeypatch.setattr(main.batching, "batch_directory", lambda _: tmp_path)
+    monkeypatch.setattr(main, "update_batch", lambda batch_id, **values: updates.append((batch_id, values)))
+    monkeypatch.setattr(main, "serialize_batch", lambda value: value)
+    with pytest.raises(HTTPException) as mismatch:
+        main.confirm_batch_download("batch-1", BatchDownloadAck(size_bytes=3))
+    assert mismatch.value.status_code == 409
+    result = main.confirm_batch_download("batch-1", BatchDownloadAck(size_bytes=output.stat().st_size))
+    assert result == row
+    assert updates[-1][1]["download_confirmed_bytes"] == output.stat().st_size
 
 
 def test_concat_videos_normalizes_different_episode_sizes(tmp_path):

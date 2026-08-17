@@ -23,6 +23,9 @@ class Settings(BaseModel):
     vieneu_runner: Path = SERVER_DIR / "scripts" / "vieneu_batch.py"
     narrator_reference: Path = SERVER_DIR / "data" / "voices" / "ngoc-huyen-authorized-reference.wav"
     max_upload_bytes: int = 5 * 1024 * 1024 * 1024
+    storage_warning_bytes: int = 15 * 1024 * 1024 * 1024
+    storage_reserve_bytes: int = 8 * 1024 * 1024 * 1024
+    combine_size_multiplier: float = 3.2
 
 
 @lru_cache

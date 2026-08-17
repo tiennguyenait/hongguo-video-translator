@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import re
+import logging
+import shutil
+import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -13,8 +17,44 @@ from PIL import Image
 from . import media
 from .config import get_settings
 from .database import (
-    add_batch_job, create_batch, get_batch, get_batch_jobs, get_job_batch, update_batch, utc_now,
+    add_batch_job, create_batch, get_batch, get_batch_jobs, get_job_batch,
+    list_batches_by_status, update_batch, utc_now,
 )
+
+logger = logging.getLogger(__name__)
+_combine_lock = threading.Lock()
+_active_combines: set[str] = set()
+
+
+class InsufficientStorageError(RuntimeError):
+    pass
+
+
+def storage_status() -> dict[str, int | bool]:
+    settings = get_settings()
+    usage = shutil.disk_usage(settings.data_dir)
+    return {
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+        "warning": usage.free < settings.storage_warning_bytes,
+        "accepting_uploads": usage.free >= settings.storage_reserve_bytes,
+    }
+
+
+def require_upload_capacity(additional_bytes: int = 0) -> None:
+    settings = get_settings()
+    free = int(storage_status()["free_bytes"])
+    required = settings.storage_reserve_bytes + max(0, additional_bytes)
+    if free < required:
+        raise InsufficientStorageError(
+            f"Insufficient server storage: {free / (1024**3):.1f} GiB free; "
+            f"at least {required / (1024**3):.1f} GiB is required"
+        )
+
+
+def estimated_combine_bytes(inputs: list[Path]) -> int:
+    return round(sum(path.stat().st_size for path in inputs) * get_settings().combine_size_multiplier)
 
 
 def natural_filename_key(filename: str) -> list[tuple[int, Any]]:
@@ -111,7 +151,7 @@ def finalize_batch_for_job(job_id: str) -> None:
     batch, episodes = get_batch(batch_id), get_batch_jobs(batch_id)
     if not batch or not episodes:
         return
-    if batch["status"] == "uploading":
+    if batch["status"] in {"uploading", "done"}:
         return
     failed = [item for item in episodes if item["status"] in {"failed", "needs_review"}]
     active = [item for item in episodes if item["status"] in {"queued", "running"}]
@@ -145,17 +185,35 @@ def finalize_batch_for_job(job_id: str) -> None:
             error=None,
         )
         return
+    with _combine_lock:
+        if batch_id in _active_combines:
+            return
+        _active_combines.add(batch_id)
     output_name = str(batch.get("output_filename") or _unique_output_filename(batch, episodes))
-    update_batch(
-        batch_id, status="combining", output_filename=output_name,
-        progress_message=f"Combining {len(episodes)} translated episodes", error=None,
-    )
-    batch["output_filename"] = output_name
     source_name = "vi-dubbed.mp4" if batch["dub"] else "vi-burned.mp4" if batch["burn_subtitles"] else "source.mp4"
     inputs = [get_settings().jobs_dir / item["id"] / source_name for item in episodes]
     directory = batch_directory(batch_id)
     output = directory / output_name
     try:
+        missing = [str(path) for path in inputs if not path.is_file()]
+        if missing:
+            raise RuntimeError(f"Combined inputs are missing: {missing[:3]}")
+        required = estimated_combine_bytes(inputs) + get_settings().storage_reserve_bytes
+        free = int(storage_status()["free_bytes"])
+        if free < required:
+            update_batch(
+                batch_id, status="waiting_for_space", output_filename=output_name,
+                progress_message=(
+                    f"Waiting for disk space before combining {len(episodes)} episodes: "
+                    f"{free / (1024**3):.1f} GiB free, {required / (1024**3):.1f} GiB required"
+                ), error=None,
+            )
+            return
+        update_batch(
+            batch_id, status="combining", output_filename=output_name,
+            progress_message=f"Combining {len(episodes)} translated episodes", error=None,
+        )
+        batch["output_filename"] = output_name
         logo = directory / "logo.png"
         branded = bool(batch.get("channel_name") and logo.is_file())
         media.concat_videos(
@@ -168,3 +226,29 @@ def finalize_batch_for_job(job_id: str) -> None:
         )
     except Exception as exc:
         update_batch(batch_id, status="failed", progress_message="Combining episodes failed", error=str(exc))
+    finally:
+        with _combine_lock:
+            _active_combines.discard(batch_id)
+
+
+def recover_interrupted_batches() -> None:
+    """Resume final encodes lost to a restart and retry batches after space is freed."""
+    for batch in list_batches_by_status(("combining", "waiting_for_space")):
+        episodes = get_batch_jobs(batch["id"])
+        if not episodes:
+            continue
+        try:
+            finalize_batch_for_job(episodes[-1]["id"])
+        except Exception:
+            logger.exception("Cannot recover batch combine %s", batch["id"])
+
+
+def start_batch_recovery_monitor(interval_seconds: int = 60) -> threading.Thread:
+    def monitor() -> None:
+        while True:
+            recover_interrupted_batches()
+            time.sleep(interval_seconds)
+
+    thread = threading.Thread(target=monitor, name="hongguo-batch-recovery", daemon=True)
+    thread.start()
+    return thread

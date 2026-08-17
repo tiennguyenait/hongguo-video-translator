@@ -79,6 +79,10 @@ def init_db() -> None:
             db.execute("ALTER TABLE batches ADD COLUMN output_filename TEXT NOT NULL DEFAULT ''")
         if "expected_episodes" not in batch_columns:
             db.execute("ALTER TABLE batches ADD COLUMN expected_episodes INTEGER NOT NULL DEFAULT 0")
+        if "download_confirmed_at" not in batch_columns:
+            db.execute("ALTER TABLE batches ADD COLUMN download_confirmed_at TEXT")
+        if "download_confirmed_bytes" not in batch_columns:
+            db.execute("ALTER TABLE batches ADD COLUMN download_confirmed_bytes INTEGER")
 
 
 def create_job(values: dict[str, Any]) -> dict[str, Any]:
@@ -141,6 +145,17 @@ def get_batch_jobs(batch_id: str) -> list[dict[str, Any]]:
             """SELECT bj.position, bj.filename, j.* FROM batch_jobs bj
                JOIN jobs j ON j.id = bj.job_id WHERE bj.batch_id = ? ORDER BY bj.position""",
             (batch_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_batches_by_status(statuses: tuple[str, ...]) -> list[dict[str, Any]]:
+    if not statuses:
+        return []
+    placeholders = ",".join("?" for _ in statuses)
+    with connect() as db:
+        rows = db.execute(
+            f"SELECT * FROM batches WHERE status IN ({placeholders}) ORDER BY created_at", statuses,
         ).fetchall()
     return [dict(row) for row in rows]
 

@@ -87,4 +87,11 @@ class BatchResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     output: str | None
+    download_confirmed_at: datetime | None = None
+    download_confirmed_bytes: int | None = None
+    eligible_for_cleanup: bool = False
     episodes: list[BatchEpisode]
+
+
+class BatchDownloadAck(BaseModel):
+    size_bytes: int = Field(gt=0)
