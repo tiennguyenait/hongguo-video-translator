@@ -12,6 +12,48 @@ WHISPERX_BIN = Path("/workspace/third_party/pyvideotrans/.venv/bin/whisperx")
 LOCAL_LARGE_V3 = Path("/workspace/third_party/pyvideotrans/models/models--Systran--faster-whisper-large-v3")
 
 
+def _transcript_metrics(payload: dict, video_duration: float) -> dict[str, float | int]:
+    """Measure aligned speech conservatively without double-counting overlaps."""
+    intervals: list[tuple[float, float]] = []
+    units = 0
+    for word in payload.get("word_segments", []):
+        try:
+            start, end = float(word["start"]), float(word["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = str(word.get("word", "")).strip()
+        if not text or end <= start:
+            continue
+        intervals.append((max(0.0, start), min(video_duration, end)))
+        units += len(text.replace(" ", ""))
+    merged: list[list[float]] = []
+    for start, end in sorted(intervals):
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    speech_seconds = sum(end - start for start, end in merged)
+    return {
+        "speech_seconds": speech_seconds,
+        "coverage": speech_seconds / video_duration if video_duration > 0 else 0.0,
+        "units": units,
+        "words": len(intervals),
+    }
+
+
+def _catastrophically_sparse(payload: dict, video_duration: float) -> bool:
+    """Flag only near-empty ASR on a substantial video, not naturally quiet scenes."""
+    if video_duration < 30:
+        return False
+    metrics = _transcript_metrics(payload, video_duration)
+    return bool(
+        metrics["speech_seconds"] < max(0.75, video_duration * 0.015)
+        and metrics["units"] < 4
+    )
+
+
 def _group_words(words: list[dict]) -> tuple[list[srt.Subtitle], dict[int, str]]:
     cleaned: list[dict] = []
     for raw in words:
@@ -91,6 +133,13 @@ def transcribe_aligned(
         raise RuntimeError("WhisperX environment is not installed")
     work_dir = video.parent / "whisperx"
     work_dir.mkdir(exist_ok=True)
+    duration_result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(video)],
+        text=True, capture_output=True,
+    )
+    if duration_result.returncode or not duration_result.stdout.strip():
+        raise RuntimeError(f"Cannot measure source duration for ASR coverage: {duration_result.stderr.strip()}")
+    video_duration = float(duration_result.stdout.strip())
     model = str(LOCAL_LARGE_V3) if model_name == "large-v3" and LOCAL_LARGE_V3.is_dir() else model_name
     command = [
         str(WHISPERX_BIN), str(video), "--model", model, "--language", language,
@@ -118,12 +167,55 @@ def transcribe_aligned(
         diarize_index = fallback.index("--diarize")
         fallback = fallback[:diarize_index]
         result = subprocess.run(fallback, text=True, capture_output=True, timeout=3600)
+        if not result.returncode:
+            # Reuse the proven non-diarized command if sparse coverage also
+            # requires a sensitive-VAD retry; otherwise the gated flags would
+            # be accidentally reintroduced.
+            command = fallback
     if result.returncode:
         raise RuntimeError(f"WhisperX failed: {result.stderr.strip()[-4000:]}")
     json_path = work_dir / f"{video.stem}.json"
     if not json_path.is_file():
         raise RuntimeError("WhisperX did not produce aligned JSON")
     payload = json.loads(json_path.read_text(encoding="utf-8"))
+    if _catastrophically_sparse(payload, video_duration):
+        first_payload = payload
+        first_metrics = _transcript_metrics(first_payload, video_duration)
+        if progress:
+            progress(
+                "WhisperX transcript coverage is suspiciously sparse "
+                f"({first_metrics['speech_seconds']:.2f}s/{video_duration:.2f}s); "
+                "retrying with sensitive VAD"
+            )
+        sensitive_command = command + ["--vad_onset", "0.20", "--vad_offset", "0.15"]
+        sensitive_result = subprocess.run(sensitive_command, text=True, capture_output=True, timeout=3600)
+        if sensitive_result.returncode:
+            raise RuntimeError(
+                "WhisperX sensitive-VAD retry failed after sparse transcript: "
+                f"{sensitive_result.stderr.strip()[-4000:]}"
+            )
+        sensitive_payload = json.loads(json_path.read_text(encoding="utf-8"))
+        sensitive_metrics = _transcript_metrics(sensitive_payload, video_duration)
+        payload = max(
+            (first_payload, sensitive_payload),
+            key=lambda item: (
+                _transcript_metrics(item, video_duration)["units"],
+                _transcript_metrics(item, video_duration)["speech_seconds"],
+            ),
+        )
+        json_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        best_metrics = _transcript_metrics(payload, video_duration)
+        if progress:
+            progress(
+                "Sensitive-VAD ASR coverage: "
+                f"{best_metrics['speech_seconds']:.2f}s speech, {best_metrics['units']} text units"
+            )
+        if _catastrophically_sparse(payload, video_duration):
+            raise RuntimeError(
+                "ASR coverage remained catastrophically sparse after sensitive-VAD retry: "
+                f"{best_metrics['speech_seconds']:.2f}s speech across a {video_duration:.2f}s video. "
+                "Manual review or a different ASR strategy is required; refusing to render a mostly undubbed video."
+            )
     subtitles, speakers = _group_words(payload.get("word_segments", []))
     if not subtitles:
         raise RuntimeError("WhisperX returned no aligned speech")

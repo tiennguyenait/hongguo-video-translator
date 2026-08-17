@@ -35,14 +35,23 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
     source_path = job_dir / "source.srt"
     if source_path.is_file():
         source_by_id = {cue.index: cue for cue in srt.parse(source_path.read_text(encoding="utf-8-sig"))}
-    # Whisper alignment occasionally emits a punctuation mark or one orphaned
-    # CJK character as its own cue. The scene editor may safely absorb its
-    # meaning into adjacent dialogue, leaving this display slot empty. That is a
-    # review warning, not content loss; longer empty source cues remain errors.
+    # Whisper alignment occasionally emits a punctuation mark, one orphaned
+    # character, or a very short Latin phoneme fragment (for example "ess") as
+    # its own cue. The scene editor may safely discard that ASR noise. Keep this
+    # narrowly bounded by both text length and cue duration so real dialogue
+    # that was accidentally emptied remains a blocking error.
+    def ignorable_asr_fragment(cue: srt.Subtitle) -> bool:
+        compact = re.sub(r"[^\w\u3400-\u9fff]", "", cue.content, flags=re.UNICODE)
+        duration = (cue.end - cue.start).total_seconds()
+        return len(compact) <= 1 or (
+            duration <= 0.5
+            and re.fullmatch(r"[A-Za-z]{1,3}", compact) is not None
+        )
+
     ignorable_empty = [
         item_id for item_id in empty
         if item_id in source_by_id
-        and len(re.sub(r"[^\w\u3400-\u9fff]", "", source_by_id[item_id].content, flags=re.UNICODE)) <= 1
+        and ignorable_asr_fragment(source_by_id[item_id])
     ]
     unsafe_empty = [item_id for item_id in empty if item_id not in ignorable_empty]
     if unsafe_empty:

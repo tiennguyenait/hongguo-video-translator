@@ -12,7 +12,7 @@ from app.config import get_settings
 from app.jobs import JobWorker, apply_subtitle_review, safe_job_file
 from app.schemas import JobCreate
 from app.subtitle import parse_translation_json, segments_to_subtitles
-from app.speech_pipeline import _group_words
+from app.speech_pipeline import _catastrophically_sparse, _group_words, _transcript_metrics
 from app.tts import _fit_audio_to_window, build_utterances
 from app.artifacts import ArtifactManifest, stable_hash
 from app.dialogue import build_dialogue_units, repair_fragment_speakers
@@ -237,12 +237,92 @@ def test_translation_json_parsing_and_validation():
         parse_translation_json('[{"id":1,"text":"Xin"},{"id":3,"text":"Chào"}]', [1, 2], allow_missing=True)
 
 
+def test_asr_coverage_guard_catches_nearly_empty_long_video():
+    payload = {"word_segments": [{"word": "呃", "start": 14.037, "end": 14.058}]}
+    metrics = _transcript_metrics(payload, 115.067)
+    assert metrics["units"] == 1
+    assert metrics["speech_seconds"] == pytest.approx(0.021)
+    assert _catastrophically_sparse(payload, 115.067)
+
+
+def test_asr_coverage_guard_allows_quiet_video_with_real_phrase():
+    payload = {"word_segments": [
+        {"word": "我", "start": 40.0, "end": 40.4},
+        {"word": "知道了", "start": 40.4, "end": 41.3},
+    ]}
+    assert not _catastrophically_sparse(payload, 120.0)
+
+
+def test_asr_metrics_merge_overlapping_alignment_intervals():
+    payload = {"word_segments": [
+        {"word": "你", "start": 1.0, "end": 2.0},
+        {"word": "好", "start": 1.8, "end": 2.5},
+    ]}
+    metrics = _transcript_metrics(payload, 10.0)
+    assert metrics["speech_seconds"] == pytest.approx(1.5)
+    assert metrics["coverage"] == pytest.approx(0.15)
+
+
+def test_sparse_asr_automatically_retries_with_sensitive_vad(monkeypatch, tmp_path):
+    import app.speech_pipeline as pipeline
+
+    fake_bin = tmp_path / "bin" / "whisperx"
+    fake_bin.parent.mkdir()
+    fake_bin.touch()
+    video = tmp_path / "source.mp4"
+    video.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, stdout="120.0\n", stderr="")
+        output = tmp_path / "whisperx" / "source.json"
+        output.parent.mkdir(exist_ok=True)
+        sensitive = "--vad_onset" in command
+        words = (
+            [
+                {"word": "我", "start": 10.0, "end": 10.4},
+                {"word": "知道了", "start": 10.4, "end": 11.3},
+            ]
+            if sensitive
+            else [{"word": "呃", "start": 14.037, "end": 14.058}]
+        )
+        output.write_text(json.dumps({"word_segments": words}), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(pipeline, "WHISPERX_BIN", fake_bin)
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    messages = []
+    subtitles, _speakers = pipeline.transcribe_aligned(
+        video, tmp_path / "source.srt", "large-v3", "zh", False, None, None, messages.append,
+    )
+    assert [cue.content for cue in subtitles] == ["我知道了"]
+    assert any("suspiciously sparse" in message for message in messages)
+    assert any("--vad_onset" in command and "0.20" in command for command in calls)
+
+
 def test_qa_allows_empty_one_character_asr_fragments_but_not_real_lines(tmp_path):
     from app.qa import validate_job
     from app.subtitle import write_srt
     source = [
         srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "。"),
         srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=2), "正常台词"),
+    ]
+    write_srt(tmp_path / "source.srt", source)
+    safe = validate_job(tmp_path, [srt.Subtitle(1, source[0].start, source[0].end, "")], [1], None)
+    assert safe["summary"]["error"] == 0
+    assert next(item for item in safe["checks"] if item["name"] == "empty_lines")["severity"] == "warning"
+    unsafe = validate_job(tmp_path, [srt.Subtitle(2, source[1].start, source[1].end, "")], [2], None)
+    assert unsafe["summary"]["error"] == 1
+
+
+def test_qa_allows_only_short_latin_asr_noise(tmp_path):
+    from app.qa import validate_job
+    from app.subtitle import write_srt
+    source = [
+        srt.Subtitle(1, timedelta(0), timedelta(milliseconds=300), "ess"),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=2), "yes"),
     ]
     write_srt(tmp_path / "source.srt", source)
     safe = validate_job(tmp_path, [srt.Subtitle(1, source[0].start, source[0].end, "")], [1], None)
@@ -287,6 +367,30 @@ def test_malformed_optional_shortening_keeps_valid_translation(monkeypatch, tmp_
     )
     assert translated[0].content == "Trưởng lão đã chú ý, tuyệt đối không được đắc tội."
     assert any("shortening was unusable" in message for message in messages)
+
+
+def test_shortening_prompt_enforces_exact_json_contract(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"translation_scene_review": False})
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    calls = []
+
+    def provider(_provider, system, prompt):
+        calls.append((system, prompt))
+        if len(calls) == 1:
+            return '{"translations":[{"id":10,"text":"Trưởng lão đã chú ý, tuyệt đối không được đắc tội."}]}'
+        return '{"translations":[{"id":10,"text":"Đừng đắc tội trưởng lão."}]}'
+
+    monkeypatch.setattr("app.translator._openai_compatible", provider)
+    cue = srt.Subtitle(10, timedelta(0), timedelta(seconds=1.421), "老已经看中我万不可得罪")
+    translated = translate_subtitles(
+        [cue], "deepseek", "Chinese", "Vietnamese", job_dir=tmp_path,
+    )
+    assert translated[0].content == "Đừng đắc tội trưởng lão."
+    system, prompt = calls[1]
+    assert "OUTPUT CONTRACT (mandatory)" in system
+    assert "only allowed item fields are id and text" in system
+    assert "Required ids, in order: [10]" in prompt
+    assert '{"translations":[{"id":1,"text":"Vietnamese dialogue"}]}' in prompt
 
 
 def test_translation_recovers_only_ids_omitted_by_provider(monkeypatch, tmp_path):

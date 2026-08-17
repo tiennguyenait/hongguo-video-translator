@@ -41,7 +41,18 @@ _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 SHORTEN_SYSTEM_PROMPT = """You are a Vietnamese dialogue editor.
 Rewrite each Vietnamese line into natural, conversational short-drama dialogue.
 Keep the same intent, emotion, names and important facts, but remove redundant wording.
-Never exceed max_words. Return valid JSON only with exactly the same ids and text fields."""
+Never exceed max_words.
+
+OUTPUT CONTRACT (mandatory):
+- Return exactly one JSON object in this shape: {"translations":[{"id":1,"text":"Vietnamese dialogue"}]}.
+- Each input item must produce exactly one item in translations.
+- Copy every input id exactly; do not omit, add, renumber, or stringify ids.
+- The only allowed item fields are id and text. Never rename them to translation,
+  shortened_text, content, output, cue_id, index, or any other name.
+- translations must always be a JSON array, even when there is only one item.
+- text must be a non-empty JSON string.
+- Do not return Markdown fences, comments, explanations, or any text outside the JSON object.
+Before responding, silently verify that the returned ids exactly match the input ids."""
 SCENE_EDITOR_PROMPT = """You are the final dialogue editor for a Vietnamese short drama.
 Edit the supplied Vietnamese scene as one coherent conversation.
 Rules:
@@ -189,7 +200,11 @@ def translate_subtitles(
                     ]
                     shorten_prompt = (
                         "Shorten these lines. Natural Vietnamese is more important than literal wording. "
-                        "Return the same ids:\n" + json.dumps(shorten_items, ensure_ascii=False)
+                        f"Required ids, in order: {overlong}. Return each required id exactly once. "
+                        "Your entire response must be one JSON object with this exact structure: "
+                        '{"translations":[{"id":1,"text":"Vietnamese dialogue"}]}. '
+                        "Replace the example values with the results; never change the field names.\n"
+                        "INPUT:\n" + json.dumps(shorten_items, ensure_ascii=False)
                     )
                     try:
                         shortened_raw = (
