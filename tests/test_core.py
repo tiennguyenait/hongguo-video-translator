@@ -24,7 +24,11 @@ from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
 from app.source_subtitle_mask import SubtitleRegion
 from app.dialogue_master import _coalesce_speech_groups, build_dialogue_master
 from app.translator import translate_subtitles
-from app.media import AUDIO_BITRATE, VIDEO_CRF, _merge_video_encode_args, apply_channel_watermark, concat_videos, probe_duration, probe_video_size
+from app.media import (
+    AUDIO_BITRATE, NARRATION_LOUDNESS_LUFS, NARRATION_LRA, NARRATION_TRUE_PEAK_DB,
+    VIDEO_CRF, _merge_video_encode_args, apply_channel_watermark, concat_videos,
+    probe_duration, probe_video_size,
+)
 from app.batching import _unique_output_filename, finalize_batch_for_job, natural_filename_key
 import app.batching as batching
 from scripts.vieneu_batch import split_for_natural_pauses
@@ -57,6 +61,9 @@ def test_pause_between_spoken_lines_follows_terminal_punctuation():
 def test_delivery_encoding_balances_size_and_compatibility():
     assert VIDEO_CRF == "23"
     assert AUDIO_BITRATE == "128k"
+    assert NARRATION_LOUDNESS_LUFS == -13.5
+    assert NARRATION_LRA == 2.5
+    assert NARRATION_TRUE_PEAK_DB == -1.0
 
 
 def test_merge_encoding_uses_source_size_budget_and_gpu_when_available(tmp_path, monkeypatch):
@@ -535,6 +542,84 @@ def test_utterances_join_only_same_speaker():
     assert [(item.content, speaker) for item, speaker in utterances] == [("Xin chào anh nhé", "A"), ("Được rồi", "B")]
 
 
+def test_sentence_aligned_utterances_join_visual_lines_until_punctuation():
+    from app.tts import sentence_aligned_utterances
+    cues = [
+        srt.Subtitle(1, timedelta(seconds=1), timedelta(seconds=2), "Nếu tiền bối"),
+        srt.Subtitle(2, timedelta(seconds=3), timedelta(seconds=4), "muốn hại ta,"),
+        srt.Subtitle(3, timedelta(seconds=4), timedelta(seconds=5), "ta đã chết rồi."),
+        srt.Subtitle(4, timedelta(seconds=5), timedelta(seconds=6), "Đúng vậy!"),
+    ]
+    utterances = sentence_aligned_utterances(cues, {1: "A", 2: "A", 3: "A", 4: "B"})
+    assert [(cue.index, cue.start.total_seconds(), cue.end.total_seconds(), cue.content, ids) for cue, _, ids in utterances] == [
+        (1, 1.0, 5.0, "Nếu tiền bối muốn hại ta, ta đã chết rồi.", [1, 2, 3]),
+        (4, 5.0, 6.0, "Đúng vậy!", [4]),
+    ]
+
+
+def test_retime_subtitles_distributes_lines_inside_measured_audio():
+    from app.tts import retime_subtitles_to_tts
+    cues = [
+        srt.Subtitle(1, timedelta(seconds=10), timedelta(seconds=12), "Nếu tiền bối"),
+        srt.Subtitle(2, timedelta(seconds=12), timedelta(seconds=14), "muốn hại ta,"),
+        srt.Subtitle(3, timedelta(seconds=14), timedelta(seconds=16), "ta đã chết rồi."),
+    ]
+    timing = [{
+        "id": 1, "cue_ids": [1, 2, 3], "scheduled_start_ms": 10_000,
+        "fitted_ms": 4_500,
+    }]
+    aligned = retime_subtitles_to_tts(cues, timing)
+    assert [cue.index for cue in aligned] == [1, 2, 3]
+    assert aligned[0].start == timedelta(seconds=10)
+    assert aligned[-1].end == timedelta(seconds=14.5)
+    assert aligned[0].end == aligned[1].start
+    assert aligned[1].end == aligned[2].start
+    assert [item["id"] for item in timing[0]["aligned_cues"]] == [1, 2, 3]
+
+
+def test_retime_subtitles_preserves_silence_between_sentences():
+    from app.tts import retime_subtitles_to_tts
+    cues = [
+        srt.Subtitle(1, timedelta(seconds=1), timedelta(seconds=2), "Một."),
+        srt.Subtitle(2, timedelta(seconds=5), timedelta(seconds=6), "Hai."),
+    ]
+    timing = [
+        {"id": 1, "cue_ids": [1], "scheduled_start_ms": 1_000, "fitted_ms": 600},
+        {"id": 2, "cue_ids": [2], "scheduled_start_ms": 5_000, "fitted_ms": 700},
+    ]
+    aligned = retime_subtitles_to_tts(cues, timing)
+    assert aligned[0].end == timedelta(seconds=1.6)
+    assert aligned[1].start == timedelta(seconds=5)
+
+
+def test_retime_subtitles_rejects_missing_or_reordered_cues():
+    from app.tts import retime_subtitles_to_tts
+    cues = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "Một"),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=2), "Hai."),
+    ]
+    with pytest.raises(ValueError, match="cover every subtitle id"):
+        retime_subtitles_to_tts(cues, [{
+            "id": 2, "cue_ids": [2], "scheduled_start_ms": 0, "fitted_ms": 500,
+        }])
+
+
+def test_qa_rejects_grouped_or_shifted_tts_timeline(tmp_path):
+    from app.qa import validate_job
+    subtitles = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "Một."),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=2), "Hai."),
+    ]
+    (tmp_path / "tts-timing.json").write_text(json.dumps([{
+        "id": 1, "cue_ids": [1], "tempo": 1.0, "overflow_ms": 0, "alignment_mode": "sentence_group",
+        "schedule_shift_ms": 0,
+    }]), encoding="utf-8")
+    report = validate_job(tmp_path, subtitles, [1, 2], None)
+    checks = {item["name"]: item["severity"] for item in report["checks"]}
+    assert checks["tts_cue_coverage"] == "error"
+    assert checks["tts_cue_alignment"] == "error"
+
+
 def test_utterances_remove_translation_boundary_ellipsis():
     import srt
     cues = [
@@ -765,8 +850,8 @@ def test_adaptive_mask_never_shrinks_below_source_bounds(tmp_path):
     assert background["x"] + background["width"] >= region.x + region.width
     assert background["y"] <= region.y
     assert background["y"] + background["height"] >= region.y + region.height
-    assert report[0]["render_start"] == 2
-    assert report[0]["render_end"] == 3
+    assert report[0]["render_start"] == 1
+    assert report[0]["render_end"] == 4
 
 
 def test_adaptive_subtitle_normalizes_vietnamese_and_uses_static_font(tmp_path):

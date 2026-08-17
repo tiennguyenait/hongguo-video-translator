@@ -126,13 +126,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         region = max(regions, key=lambda item: (overlap(item), -min(abs(midpoint-item.start), abs(midpoint-item.end))))
         overlapping_regions = [item for item in regions if overlap(item) > 0]
         visual_overlap = sum(overlap(item) for item in overlapping_regions)
-        # Use visual boundaries when detector support is meaningful. A tiny
-        # single-frame overlap is treated as uncertain and retains speech timing.
-        if visual_overlap >= min(0.35, (cue_end-cue_start) * 0.30):
-            render_start = max(cue_start, min(item.start for item in overlapping_regions))
-            render_end = min(cue_end, max(item.end for item in overlapping_regions))
-        else:
-            render_start, render_end = cue_start, cue_end
+        # Source masks retain their detected lifetimes in the background events
+        # above. Vietnamese text must follow its voice-aligned cue exactly and
+        # must never be clamped back to unrelated source-ASR boundaries.
+        render_start, render_end = cue_start, cue_end
         max_font_size = round(video_height * 0.047)
         natural_width = _text_width(normalized_text, _font(max_font_size)) + round(video_width * 0.028)
         available_width = round(min(video_width * 0.88, max(region.width * 0.96, natural_width)))

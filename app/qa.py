@@ -74,8 +74,40 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
         timing = json.loads(timing_path.read_text(encoding="utf-8"))
         rushed = [item["id"] for item in timing if item.get("tempo", 1.0) > 1.18]
         overflow = [item["id"] for item in timing if item.get("overflow_ms", 0) > 150]
+        timing_ids = [item_id for item in timing for item_id in item.get("cue_ids", [item.get("id")])]
+        misaligned = [
+            item.get("id") for item in timing
+            if item.get("alignment_mode") != "punctuated_sentence"
+            or item.get("schedule_shift_ms", 0) < 0
+        ]
         add("tts_speed", "pass" if not rushed else "warning", "TTS speed is within natural limits" if not rushed else f"Review rushed utterances: {rushed[:20]}")
         add("tts_deadlines", "pass" if not overflow else "warning", "TTS clips fit their windows" if not overflow else f"Audio exceeds windows: {overflow[:20]}")
+        add(
+            "tts_cue_coverage", "pass" if timing_ids == expected_ids else "error",
+            "Every subtitle cue belongs to exactly one punctuated TTS phrase" if timing_ids == expected_ids
+            else "TTS phrases are missing, duplicated, or reorder subtitle cues",
+        )
+        add(
+            "tts_cue_alignment", "pass" if not misaligned else "error",
+            "No TTS phrase starts before its first source cue" if not misaligned
+            else f"TTS phrases start before their source cues: {misaligned[:20]}",
+        )
+        aligned_path = job_dir / "vi-aligned.srt"
+        if aligned_path.is_file():
+            aligned = list(srt.parse(aligned_path.read_text(encoding="utf-8-sig")))
+            aligned_ids = [cue.index for cue in aligned]
+            invalid_aligned = [
+                cue.index for index, cue in enumerate(aligned)
+                if cue.end <= cue.start
+                or (index and cue.start < aligned[index - 1].end)
+            ]
+            add(
+                "tts_subtitle_sync",
+                "pass" if aligned_ids == expected_ids and not invalid_aligned else "error",
+                "Voice-aligned subtitles preserve every cue without overlap"
+                if aligned_ids == expected_ids and not invalid_aligned
+                else f"Invalid voice-aligned subtitle cues: {invalid_aligned[:20]}",
+            )
 
     master_path = job_dir / "dialogue-master.json"
     if master_path.is_file():

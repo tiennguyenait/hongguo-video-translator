@@ -30,6 +30,7 @@ OUTPUT_NAMES = {
     "qa_report": "qa-report.json",
     "subtitle_regions": "subtitle-regions.json",
     "subtitle_layout": "subtitle-layout.json",
+    "aligned_srt": "vi-aligned.srt",
 }
 UPLOAD_EXTENSIONS = {".mp4"}
 
@@ -288,7 +289,10 @@ class JobWorker:
             }
             atomic_write_json(master_path, master_payload)
             manifest.complete("dialogue_master", master_fingerprint, [translated_srt, master_path], {"utterances": len(master_utterances)})
-        if job["burn_subtitles"]:
+        # When dubbing is enabled, subtitles are burned only after the real TTS
+        # duration has retimed each display line. Burn-only jobs retain the
+        # original source-aligned SRT behavior.
+        if job["burn_subtitles"] and not job["dub"]:
             burned = directory / "vi-burned.mp4"
             burn_fingerprint = stable_hash({"video_bytes": video.stat().st_size, "srt": translated_srt.read_text(encoding="utf-8"), "style": "adaptive-ass-v10-h264-crf23", "mask": [region.to_dict() for region in regions]})
             expected_burn_files = [burned] + ([directory / "vi.ass", directory / "subtitle-layout.json"] if regions else [])
@@ -299,11 +303,12 @@ class JobWorker:
                 media.burn_subtitles(video, translated_srt, burned, regions)
                 manifest.complete("burn", burn_fingerprint, expected_burn_files)
         if job["dub"]:
-            dub_video_base = directory / "vi-burned.mp4" if job["burn_subtitles"] else video
+            dub_video_base = video
             dubbed = directory / "vi-dubbed.mp4"
             base_stat = dub_video_base.stat()
-            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "master": master_payload, "video_base": [base_stat.st_size, base_stat.st_mtime_ns], "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "sidechain-v4-48k-aac128", "prosody": "conservative-v1", "timing": "sentence-utterance-v4-1.18-full-gap-trim-v1"})
-            if manifest.valid("dub", dub_fingerprint, [dubbed, directory / "speech-plan.json", directory / "prosody-plan.json", directory / "tts-timing.json"]):
+            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "master": master_payload, "video_base": [base_stat.st_size, base_stat.st_mtime_ns], "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "review-master-v6-minus13.5lufs-lra2.5-tp1", "prosody": "conservative-v1", "timing": "punctuated-sentence-v4-sequential-retimed-display", "burn": bool(job["burn_subtitles"]), "mask": [region.to_dict() for region in regions]})
+            dub_outputs = [dubbed, directory / "speech-plan.json", directory / "prosody-plan.json", directory / "tts-timing.json", directory / "vi-aligned.srt"]
+            if manifest.valid("dub", dub_fingerprint, dub_outputs):
                 self._progress(job_id, JobStep.DUBBING, "Resuming from cached Vietnamese dub")
             else:
                 self._progress(job_id, JobStep.DUBBING, "Creating Vietnamese natural dub")
@@ -316,7 +321,12 @@ class JobWorker:
                     job["provider"],
                     master_payload.get("utterances"),
                 )
-                manifest.complete("dub", dub_fingerprint, [dubbed, directory / "speech-plan.json", directory / "prosody-plan.json", directory / "tts-timing.json"])
+                if job["burn_subtitles"]:
+                    self._progress(job_id, JobStep.BURNING, "Burning voice-aligned Vietnamese subtitles")
+                    aligned_burned = directory / "vi-dubbed-aligned.mp4"
+                    media.burn_subtitles(dubbed, directory / "vi-aligned.srt", aligned_burned, regions)
+                    aligned_burned.replace(dubbed)
+                manifest.complete("dub", dub_fingerprint, dub_outputs)
         self._progress(job_id, JobStep.QA, "Running automatic content, timing, and media QA")
         final_video = directory / "vi-dubbed.mp4" if job["dub"] else directory / "vi-burned.mp4" if job["burn_subtitles"] else video
         report = qa.validate_job(directory, translated, [cue.index for cue in subtitles], final_video)

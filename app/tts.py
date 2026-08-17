@@ -14,10 +14,89 @@ from .media import mux_delayed_clips, probe_duration
 from .config import get_settings
 from .voice_profiles import classify_speaker_voices
 from .artifacts import atomic_write_json, stable_hash
-from .speech_plan import build_speech_plans, punctuation_pause_after_ms
+from .speech_plan import build_speech_plans, predict_duration_ms, punctuation_pause_after_ms
 from .prosody import PROSODY_VERSION, plan_prosody
 
 MAX_NATURAL_TEMPO = 1.18
+
+
+def sentence_aligned_utterances(
+    subtitles: list[srt.Subtitle], speakers: dict[int, str],
+) -> list[tuple[srt.Subtitle, str | None, list[int]]]:
+    """Join display lines until real punctuation completes the spoken phrase.
+
+    SRT line wrapping is visual, not linguistic.  Synthesizing every display
+    line separately makes the voice stop between fragments such as
+    ``Nếu tiền bối`` / ``muốn hại ta,``.  Keep the original first/last timing,
+    but send the complete punctuated phrase to TTS in one inference call.
+    """
+    if not subtitles:
+        return []
+    result: list[tuple[srt.Subtitle, str | None, list[int]]] = []
+    current: list[srt.Subtitle] = []
+    for cue in subtitles:
+        if current:
+            previous_complete = bool(re.search(r'[.!?…]["”’)]?\s*$', current[-1].content.strip()))
+            # SRT timing gaps and visual line wraps are not linguistic stops.
+            # Only punctuation in the actual dialogue may end a spoken phrase.
+            if previous_complete:
+                first, last = current[0], current[-1]
+                result.append((
+                    srt.Subtitle(first.index, first.start, last.end, " ".join(item.content.strip() for item in current)),
+                    speakers.get(first.index), [item.index for item in current],
+                ))
+                current = []
+        current.append(cue)
+    first, last = current[0], current[-1]
+    result.append((
+        srt.Subtitle(first.index, first.start, last.end, " ".join(item.content.strip() for item in current)),
+        speakers.get(first.index), [item.index for item in current],
+    ))
+    return result
+
+
+def retime_subtitles_to_tts(
+    subtitles: list[srt.Subtitle], timing: list[dict],
+) -> list[srt.Subtitle]:
+    """Place display-line boundaries inside the audio that actually speaks them.
+
+    Each sentence is synthesized naturally as one clip. Its constituent visual
+    lines are then distributed across the measured clip duration using spoken
+    syllables and punctuation as weights. This keeps the text change close to
+    the words being heard instead of retaining unrelated source-ASR timings.
+    """
+    expected_ids = [cue.index for cue in subtitles]
+    timed_ids = [item_id for item in timing for item_id in item.get("cue_ids", [])]
+    if timed_ids != expected_ids:
+        raise ValueError("TTS timing must cover every subtitle id exactly once and in order")
+    by_id = {cue.index: cue for cue in subtitles}
+    aligned: list[srt.Subtitle] = []
+    from datetime import timedelta
+
+    for phrase in timing:
+        cue_ids = [int(value) for value in phrase["cue_ids"]]
+        phrase_start_ms = int(phrase["scheduled_start_ms"])
+        phrase_duration_ms = max(len(cue_ids), int(phrase["fitted_ms"]))
+        cues = [by_id[item_id] for item_id in cue_ids]
+        weights = [max(1, predict_duration_ms(cue.content)) for cue in cues]
+        total_weight = sum(weights)
+        elapsed_weight = 0
+        phrase_aligned = []
+        for index, (cue, weight) in enumerate(zip(cues, weights, strict=True)):
+            start_ms = phrase_start_ms + round(phrase_duration_ms * elapsed_weight / total_weight)
+            elapsed_weight += weight
+            end_ms = (
+                phrase_start_ms + phrase_duration_ms
+                if index == len(cues) - 1
+                else phrase_start_ms + round(phrase_duration_ms * elapsed_weight / total_weight)
+            )
+            end_ms = max(start_ms + 1, end_ms)
+            phrase_aligned.append({"id": cue.index, "start_ms": start_ms, "end_ms": end_ms})
+            aligned.append(srt.Subtitle(
+                cue.index, timedelta(milliseconds=start_ms), timedelta(milliseconds=end_ms), cue.content,
+            ))
+        phrase["aligned_cues"] = phrase_aligned
+    return aligned
 
 
 def _trim_edge_silence(audio: AudioSegment) -> AudioSegment:
@@ -195,16 +274,11 @@ def create_dub(
         )
     else:
         profiles = classify_speaker_voices(video, subtitles, speakers, voice, secondary_voice, voice_overrides)
-    if master_utterances:
-        from datetime import timedelta
-        utterances = [(
-            srt.Subtitle(
-                index=int(item["id"]), start=timedelta(seconds=float(item["start"])),
-                end=timedelta(seconds=float(item["end"])), content=str(item["full_text"]),
-            ), item.get("speaker"),
-        ) for item in master_utterances]
-    else:
-        utterances = build_utterances(subtitles, speakers)
+    # Display-line boundaries must not create artificial TTS pauses. Build
+    # complete phrases from the final punctuated SRT, without trusting the
+    # dialogue master's punctuation-normalized full_text.
+    sentence_units = sentence_aligned_utterances(subtitles, speakers)
+    utterances = [(cue, speaker) for cue, speaker, _ in sentence_units]
     plans = build_speech_plans(utterances, video_duration_ms)
     prosody_warning = None
     if narrator_mode:
@@ -227,6 +301,7 @@ def create_dub(
     timeline_cursor_ms = 0
     for number, (cue, speaker) in enumerate(utterances, 1):
         plan = plans[number - 1]
+        cue_ids = sentence_units[number - 1][2]
         clip_path = clips_dir / f"{cue.index:06d}.{'wav' if narrator_mode else 'mp3'}"
         cue_voice = profiles.get(speaker, {}).get("voice", voice)
         if not narrator_mode:
@@ -240,6 +315,9 @@ def create_dub(
         audio = _fit_audio_to_window(audio, target_window, clip_path)
         fitted_path = fitted_dir / f"{cue.index:06d}.wav"
         audio.set_frame_rate(48000).set_channels(1).set_sample_width(2).export(fitted_path, format="wav")
+        # Never overlap two narrated sentences. If a translated phrase is
+        # longer than its source window, move the next phrase (and its retimed
+        # subtitles) forward instead of speaking both at once.
         scheduled_start_ms = max(plan.start_ms + plan.pause_before_ms, timeline_cursor_ms)
         delayed_clips.append((fitted_path, scheduled_start_ms))
         timeline_cursor_ms = scheduled_start_ms + len(audio) + plan.pause_after_ms
@@ -254,9 +332,15 @@ def create_dub(
             "pause_before_ms": plan.pause_before_ms, "pause_after_ms": plan.pause_after_ms,
             "source_start_ms": plan.start_ms, "scheduled_start_ms": scheduled_start_ms,
             "schedule_shift_ms": scheduled_start_ms - plan.start_ms,
+            "alignment_mode": "punctuated_sentence",
+            "cue_ids": cue_ids,
         })
         if progress and (number == len(utterances) or number % 5 == 0):
             progress(f"Synthesized {number}/{len(utterances)} natural utterances")
+    atomic_write_json(job_dir / "tts-timing.json", timing_report)
+    aligned_subtitles = retime_subtitles_to_tts(subtitles, timing_report)
+    (job_dir / "vi-aligned.srt").write_text(srt.compose(aligned_subtitles), encoding="utf-8")
+    # Persist the cue allocation added by retime_subtitles_to_tts.
     atomic_write_json(job_dir / "tts-timing.json", timing_report)
     output = job_dir / "vi-dubbed.mp4"
     mux_delayed_clips(video, delayed_clips, output, original_audio_volume)

@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 VIDEO_CRF = "23"
 AUDIO_BITRATE = "128k"
+NARRATION_LOUDNESS_LUFS = -13.5
+NARRATION_LRA = 2.5
+NARRATION_TRUE_PEAK_DB = -1.0
 
 
 @lru_cache(maxsize=1)
@@ -273,8 +276,11 @@ def mux_delayed_clips(
         filters.append(f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:normalize=0[dubmix]")
     filters.append(
         f"[dubmix]apad=whole_dur={duration:.6f},atrim=0:{duration:.6f},"
-        "aresample=48000:async=1:first_pts=0,highpass=f=65,lowpass=f=12000,"
-        "dynaudnorm=f=250:g=7:p=0.9[dub]"
+        "aresample=48000:async=1:first_pts=0,highpass=f=75,lowpass=f=12500,"
+        "deesser=i=0.18:m=0.35:f=0.55,"
+        "acompressor=threshold=0.09:ratio=4.5:attack=8:release=120:makeup=1.8:knee=3:detection=rms,"
+        f"loudnorm=I={NARRATION_LOUDNESS_LUFS}:TP={NARRATION_TRUE_PEAK_DB}:LRA={NARRATION_LRA},"
+        "aresample=48000,alimiter=limit=0.89:level=false[dub]"
     )
     output_label = "dub"
     if original_audio_volume > 0:
@@ -285,11 +291,15 @@ def mux_delayed_clips(
         filters.append("[original][dub_sc]sidechaincompress=threshold=0.025:ratio=8:attack=18:release=280:makeup=1[ducked]")
         filters.append(
             f"[ducked][dub_mix]amix=inputs=2:duration=longest:normalize=0,atrim=0:{duration:.6f},"
-            "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,alimiter=limit=0.94[mixed]"
+            f"loudnorm=I={NARRATION_LOUDNESS_LUFS}:TP={NARRATION_TRUE_PEAK_DB}:LRA={NARRATION_LRA},"
+            "aresample=48000,alimiter=limit=0.89:level=false[mixed]"
         )
         output_label = "mixed"
     else:
-        filters.append("[dub]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,alimiter=limit=0.94[master]")
+        filters.append(
+            f"[dub]loudnorm=I={NARRATION_LOUDNESS_LUFS}:TP={NARRATION_TRUE_PEAK_DB}:LRA={NARRATION_LRA},"
+            "aresample=48000,alimiter=limit=0.89:level=false[master]"
+        )
         output_label = "master"
     script = output.parent / "dub-filter.ffscript"
     script.write_text(";\n".join(filters), encoding="utf-8")
