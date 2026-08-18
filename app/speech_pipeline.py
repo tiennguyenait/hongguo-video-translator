@@ -10,6 +10,8 @@ from .subtitle import seconds_to_timedelta, write_srt
 
 WHISPERX_BIN = Path("/workspace/third_party/pyvideotrans/.venv/bin/whisperx")
 LOCAL_LARGE_V3 = Path("/workspace/third_party/pyvideotrans/models/models--Systran--faster-whisper-large-v3")
+QWEN3_PYTHON = Path("/workspace/.venvs/qwen3-asr/bin/python")
+QWEN3_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "qwen3_asr.py"
 
 
 def _transcript_metrics(payload: dict, video_duration: float) -> dict[str, float | int]:
@@ -129,6 +131,37 @@ def transcribe_aligned(
     max_speakers: int | None,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[list[srt.Subtitle], dict[int, str]]:
+    if model_name == "qwen3-asr-1.7b":
+        qwen_error = ""
+        if not QWEN3_PYTHON.is_file() or not QWEN3_SCRIPT.is_file():
+            qwen_error = "Qwen3-ASR environment is not installed"
+        else:
+            work_dir = video.parent / "qwen3-asr"
+            work_dir.mkdir(exist_ok=True)
+            json_path = work_dir / f"{video.stem}.json"
+            if progress:
+                progress("Running Qwen3-ASR 1.7B with Qwen3 ForcedAligner 0.6B")
+            result = subprocess.run(
+                [str(QWEN3_PYTHON), str(QWEN3_SCRIPT), str(video), str(json_path), "--language", "Chinese"],
+                text=True, capture_output=True, timeout=3600,
+            )
+            if result.returncode:
+                qwen_error = result.stderr.strip()[-4000:]
+            else:
+                payload = json.loads(json_path.read_text(encoding="utf-8"))
+                subtitles, speakers = _group_words(payload.get("word_segments", []))
+                if subtitles:
+                    write_srt(output_srt, subtitles)
+                    if progress:
+                        progress(
+                            f"Qwen3-ASR aligned {len(payload.get('word_segments', []))} characters "
+                            f"in {payload.get('elapsed_seconds', 0):.2f}s"
+                        )
+                    return subtitles, speakers
+                qwen_error = "Qwen3-ASR produced no aligned speech"
+        if progress:
+            progress(f"Qwen3-ASR unavailable or unaligned; falling back to WhisperX large-v3: {qwen_error}")
+        model_name = "large-v3"
     if not WHISPERX_BIN.is_file():
         raise RuntimeError("WhisperX environment is not installed")
     work_dir = video.parent / "whisperx"

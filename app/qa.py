@@ -10,6 +10,7 @@ from pathlib import Path
 import srt
 
 from .artifacts import atomic_write_json
+from .subtitle import is_ignorable_asr_fragment
 
 
 def _probe(path: Path) -> dict:
@@ -35,23 +36,10 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
     source_path = job_dir / "source.srt"
     if source_path.is_file():
         source_by_id = {cue.index: cue for cue in srt.parse(source_path.read_text(encoding="utf-8-sig"))}
-    # Whisper alignment occasionally emits a punctuation mark, one orphaned
-    # character, or a very short Latin phoneme fragment (for example "ess") as
-    # its own cue. The scene editor may safely discard that ASR noise. Keep this
-    # narrowly bounded by both text length and cue duration so real dialogue
-    # that was accidentally emptied remains a blocking error.
-    def ignorable_asr_fragment(cue: srt.Subtitle) -> bool:
-        compact = re.sub(r"[^\w\u3400-\u9fff]", "", cue.content, flags=re.UNICODE)
-        duration = (cue.end - cue.start).total_seconds()
-        return len(compact) <= 1 or (
-            duration <= 0.5
-            and re.fullmatch(r"[A-Za-z]{1,3}", compact) is not None
-        )
-
     ignorable_empty = [
         item_id for item_id in empty
         if item_id in source_by_id
-        and ignorable_asr_fragment(source_by_id[item_id])
+        and is_ignorable_asr_fragment(source_by_id[item_id])
     ]
     unsafe_empty = [item_id for item_id in empty if item_id not in ignorable_empty]
     if unsafe_empty:
@@ -61,7 +49,10 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
     else:
         add("empty_lines", "pass", "No empty subtitles")
     chinese = [cue.index for cue in subtitles if re.search(r"[\u3400-\u9fff]", cue.content)]
-    add("untranslated_text", "pass" if not chinese else "warning", "No Chinese text remains" if not chinese else f"Possible untranslated text: {chinese[:20]}")
+    add(
+        "untranslated_text", "pass" if not chinese else "error",
+        "No Chinese text remains" if not chinese else f"Chinese text remains in Vietnamese subtitles: {chinese[:20]}",
+    )
     invalid_timing = [cue.index for cue in subtitles if cue.start.total_seconds() < 0 or cue.end <= cue.start]
     add("subtitle_timing", "pass" if not invalid_timing else "error", "Subtitle timing is valid" if not invalid_timing else f"Invalid timings: {invalid_timing}")
     repeated = [subtitles[i].index for i in range(1, len(subtitles)) if subtitles[i].content.strip().lower() == subtitles[i - 1].content.strip().lower() and len(subtitles[i].content.strip()) > 4]
@@ -72,7 +63,7 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
     timing_path = job_dir / "tts-timing.json"
     if timing_path.is_file():
         timing = json.loads(timing_path.read_text(encoding="utf-8"))
-        rushed = [item["id"] for item in timing if item.get("tempo", 1.0) > 1.18]
+        rushed = [item["id"] for item in timing if item.get("tempo", 1.0) > 1.12]
         overflow = [item["id"] for item in timing if item.get("overflow_ms", 0) > 150]
         timing_ids = [item_id for item in timing for item_id in item.get("cue_ids", [item.get("id")])]
         misaligned = [
@@ -106,7 +97,11 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
                 "pass" if aligned_ids == expected_ids and not invalid_aligned else "error",
                 "Voice-aligned subtitles preserve every cue without overlap"
                 if aligned_ids == expected_ids and not invalid_aligned
-                else f"Invalid voice-aligned subtitle cues: {invalid_aligned[:20]}",
+                else (
+                    f"Voice-aligned ids differ: expected={expected_ids[:20]}, actual={aligned_ids[:20]}"
+                    if aligned_ids != expected_ids
+                    else f"Invalid voice-aligned subtitle cues: {invalid_aligned[:20]}"
+                ),
             )
 
     master_path = job_dir / "dialogue-master.json"

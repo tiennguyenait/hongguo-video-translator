@@ -34,6 +34,7 @@ def init_db() -> None:
                 target_language TEXT NOT NULL, glossary TEXT,
                 burn_subtitles INTEGER NOT NULL, dub INTEGER NOT NULL,
                 tts_voice TEXT NOT NULL, original_audio_volume REAL NOT NULL,
+                received_bytes INTEGER, sha256 TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             )"""
         )
@@ -54,6 +55,10 @@ def init_db() -> None:
             db.execute("ALTER TABLE jobs ADD COLUMN narrator_mode INTEGER NOT NULL DEFAULT 1")
         if "hide_source_subtitles" not in columns:
             db.execute("ALTER TABLE jobs ADD COLUMN hide_source_subtitles INTEGER NOT NULL DEFAULT 1")
+        if "received_bytes" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN received_bytes INTEGER")
+        if "sha256" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN sha256 TEXT")
         db.execute(
             """CREATE TABLE IF NOT EXISTS batches (
                 id TEXT PRIMARY KEY, status TEXT NOT NULL, progress_message TEXT NOT NULL,
@@ -142,11 +147,26 @@ def get_batch(batch_id: str) -> dict[str, Any] | None:
 def get_batch_jobs(batch_id: str) -> list[dict[str, Any]]:
     with connect() as db:
         rows = db.execute(
-            """SELECT bj.position, bj.filename, j.* FROM batch_jobs bj
+            """SELECT bj.batch_id, bj.position, bj.filename, j.* FROM batch_jobs bj
                JOIN jobs j ON j.id = bj.job_id WHERE bj.batch_id = ? ORDER BY bj.position""",
             (batch_id,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def remove_batch_job(batch_id: str, position: int) -> dict[str, Any] | None:
+    """Detach one episode and delete its job row atomically."""
+    with connect() as db:
+        row = db.execute(
+            "SELECT job_id FROM batch_jobs WHERE batch_id = ? AND position = ?",
+            (batch_id, position),
+        ).fetchone()
+        if not row:
+            return None
+        job_id = str(row["job_id"])
+        db.execute("DELETE FROM batch_jobs WHERE batch_id = ? AND position = ?", (batch_id, position))
+        db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    return {"id": job_id}
 
 
 def list_batches_by_status(statuses: tuple[str, ...]) -> list[dict[str, Any]]:

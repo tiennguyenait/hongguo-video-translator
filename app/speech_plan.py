@@ -10,6 +10,12 @@ import srt
 from .text_normalizer import normalize_spoken_text
 
 
+# Dubbing should follow the original performance. TTS may borrow a little slack
+# from nearby silence, but not enough to feel detached from the actor's rhythm.
+MAX_ORIGINAL_TIMING_DRIFT_RATIO = 1.12
+MAX_ORIGINAL_TIMING_DRIFT_MS = 220
+
+
 @dataclass(slots=True)
 class SpeechPlan:
     id: int
@@ -22,7 +28,9 @@ class SpeechPlan:
     emotion: str
     pace: float
     intensity: float = 0.45
-    style: str = "doc_truyen"
+    # VieNeu's conversational preset has calmer cadence than the fast
+    # documentary preset and is a better default for translated dialogue.
+    style: str = "tu_nhien"
     pause_before_ms: int = 0
     pause_after_ms: int = 100
     prosody_source: str = "fallback"
@@ -74,7 +82,7 @@ def build_speech_plans(utterances: list[tuple[srt.Subtitle, str | None]], video_
         plans.append(SpeechPlan(
             id=cue.index, subtitle_text=cue.content, spoken_text=spoken, start_ms=start_ms,
             target_duration_ms=target_ms, hard_deadline_ms=hard_ms, predicted_duration_ms=predicted,
-            emotion=infer_emotion(cue.content), pace=min(1.18, max(0.92, predicted / max(1, target_ms))),
-            pause_after_ms=punctuation_pause_after_ms(spoken),
+            emotion=infer_emotion(cue.content), pace=min(1.12, max(0.94, predicted / max(1, target_ms))),
+            pause_after_ms=punctuation_pause_after_ms(spoken), style="tu_nhien",
         ))
     return plans

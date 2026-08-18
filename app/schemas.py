@@ -8,7 +8,9 @@ from pydantic import BaseModel, Field, field_validator
 class JobCreate(BaseModel):
     url: str
     provider: Literal["openai", "gemini", "deepseek"] = "openai"
-    asr_model: Literal["tiny", "base", "small", "medium", "large-v3"] = "large-v3"
+    # large-v3 is materially more reliable for Chinese drama dialogue than the
+    # small Qwen local default; Qwen remains available as an explicit option.
+    asr_model: Literal["tiny", "base", "small", "medium", "large-v3", "qwen3-asr-1.7b"] = "large-v3"
     diarize: bool = True
     min_speakers: int | None = Field(default=None, ge=1, le=20)
     max_speakers: int | None = Field(default=6, ge=1, le=20)
@@ -19,10 +21,7 @@ class JobCreate(BaseModel):
     burn_subtitles: bool = True
     hide_source_subtitles: bool = False
     dub: bool = True
-    narrator_mode: bool = True
     tts_voice: str = Field(default="Ngọc Huyền — authorized clone", max_length=100)
-    tts_secondary_voice: str = Field(default="vi-VN-NamMinhNeural", max_length=100)
-    voice_overrides: dict[str, Literal["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]] = Field(default_factory=dict)
     original_audio_volume: float = Field(default=0.08, ge=0.0, le=1.0)
 
     @field_validator("url")
@@ -55,6 +54,8 @@ class JobResponse(BaseModel):
     error: str | None
     provider: str
     asr_model: str
+    received_bytes: int | None = None
+    sha256: str | None = None
     diarize: bool
     burn_subtitles: bool
     hide_source_subtitles: bool
@@ -74,8 +75,12 @@ class JobReview(BaseModel):
 
 
 class BatchEpisode(BaseModel):
+    batch_id: str
     position: int
     filename: str
+    received_bytes: int | None = None
+    sha256: str | None = None
+    job_id: str
     job: JobResponse
 
 

@@ -144,6 +144,26 @@ def _unique_output_filename(batch: dict[str, Any], episodes: list[dict[str, Any]
     return f"{stamp}_{label}.mp4"
 
 
+def cleanup_combined_episode_media(episodes: list[dict[str, Any]]) -> list[str]:
+    """After a verified combine, retain metadata but discard per-episode media."""
+    removed: list[str] = []
+    jobs_root = get_settings().jobs_dir.resolve()
+    for episode in episodes:
+        directory = (jobs_root / str(episode["id"])).resolve()
+        if directory.parent != jobs_root or not directory.is_dir() or directory.is_symlink():
+            continue
+        for path in directory.iterdir():
+            if path.is_symlink():
+                continue
+            if path.is_file() and path.suffix.lower() in {".mp4", ".wav", ".mp3", ".mkv", ".webm"}:
+                path.unlink()
+                removed.append(str(path.relative_to(jobs_root)))
+            elif path.is_dir() and path.name == "tts":
+                shutil.rmtree(path)
+                removed.append(str(path.relative_to(jobs_root)) + "/")
+    return removed
+
+
 def finalize_batch_for_job(job_id: str) -> None:
     batch_id = get_job_batch(job_id)
     if not batch_id:
@@ -224,6 +244,9 @@ def finalize_batch_for_job(job_id: str) -> None:
             batch_id, status="done", output_filename=output.name,
             progress_message=f"Combined {len(episodes)} episodes successfully in one encode pass", error=None,
         )
+        removed = cleanup_combined_episode_media(episodes)
+        if removed:
+            logger.info("batch=%s storage cleanup removed %d episode media paths", batch_id, len(removed))
     except Exception as exc:
         update_batch(batch_id, status="failed", progress_message="Combining episodes failed", error=str(exc))
     finally:

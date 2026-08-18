@@ -1,5 +1,6 @@
 from datetime import timedelta
 from io import BytesIO
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -9,11 +10,17 @@ import pytest
 import srt
 
 from app.config import get_settings
-from app.jobs import JobWorker, apply_subtitle_review, safe_job_file
+from app.jobs import JobWorker, apply_subtitle_review, cleanup_completed_job_media, safe_job_file
 from app.schemas import JobCreate
-from app.subtitle import parse_translation_json, segments_to_subtitles
+from app.subtitle import parse_translation_json, read_srt, segments_to_subtitles, write_srt
 from app.speech_pipeline import _catastrophically_sparse, _group_words, _transcript_metrics
-from app.tts import _available_speech_window_ms, _fit_audio_to_window, _trim_edge_silence, build_utterances
+from app.tts import (
+    _available_speech_window_ms,
+    _fit_audio_to_window,
+    _trim_edge_silence,
+    build_utterances,
+    sentence_aligned_utterances,
+)
 from app.artifacts import ArtifactManifest, stable_hash
 from app.dialogue import build_dialogue_units, repair_fragment_speakers
 from app.speech_plan import build_speech_plans, predict_duration_ms, punctuation_pause_after_ms
@@ -23,13 +30,13 @@ from app.source_subtitle_mask import _candidate_boxes
 from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
 from app.source_subtitle_mask import SubtitleRegion
 from app.dialogue_master import _coalesce_speech_groups, build_dialogue_master
-from app.translator import translate_subtitles
+from app.translator import _record_usage, start_ai_usage, translate_subtitles
 from app.media import (
     AUDIO_BITRATE, NARRATION_LOUDNESS_LUFS, NARRATION_LRA, NARRATION_TRUE_PEAK_DB,
     VIDEO_CRF, _merge_video_encode_args, apply_channel_watermark, concat_videos,
     probe_duration, probe_video_size,
 )
-from app.batching import _unique_output_filename, finalize_batch_for_job, natural_filename_key
+from app.batching import _unique_output_filename, cleanup_combined_episode_media, finalize_batch_for_job, natural_filename_key
 import app.batching as batching
 from scripts.vieneu_batch import split_for_natural_pauses
 
@@ -39,6 +46,42 @@ def test_srt_timestamp_conversion():
     assert cues[0].start == timedelta(milliseconds=1234)
     assert cues[0].end == timedelta(milliseconds=3457)
     assert cues[0].content == "hello"
+
+
+def test_write_srt_preserves_ids_after_ignorable_empty_cue(tmp_path):
+    cues = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "Một."),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=1.1), ""),
+        srt.Subtitle(3, timedelta(seconds=1.1), timedelta(seconds=2), "Ba."),
+    ]
+    output = tmp_path / "stable.srt"
+    write_srt(output, cues)
+    assert [cue.index for cue in read_srt(output)] == [1, 2, 3]
+
+
+def test_qa_ignores_aligned_srt_absence_of_safe_empty_asr_cue(tmp_path):
+    from app.qa import validate_job
+    source = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "你好"),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=1.1), "。"),
+        srt.Subtitle(3, timedelta(seconds=1.1), timedelta(seconds=2), "再见"),
+    ]
+    translated = [
+        srt.Subtitle(1, source[0].start, source[0].end, "Xin chào."),
+        srt.Subtitle(2, source[1].start, source[1].end, ""),
+        srt.Subtitle(3, source[2].start, source[2].end, "Tạm biệt."),
+    ]
+    write_srt(tmp_path / "source.srt", source)
+    write_srt(tmp_path / "vi-aligned.srt", translated)
+    (tmp_path / "tts-timing.json").write_text(json.dumps([
+        {"id": 1, "cue_ids": [1], "alignment_mode": "punctuated_sentence", "schedule_shift_ms": 0},
+        {"id": 2, "cue_ids": [2], "alignment_mode": "punctuated_sentence", "schedule_shift_ms": 0},
+        {"id": 3, "cue_ids": [3], "alignment_mode": "punctuated_sentence", "schedule_shift_ms": 0},
+    ]), encoding="utf-8")
+    report = validate_job(tmp_path, translated, [1, 2, 3], None)
+    checks = {item["name"]: item["severity"] for item in report["checks"]}
+    assert checks["empty_lines"] == "warning"
+    assert checks["tts_subtitle_sync"] == "pass"
 
 
 def test_vieneu_pauses_follow_vietnamese_punctuation():
@@ -94,7 +137,19 @@ def test_default_job_keeps_source_subtitles_and_enables_vietnamese_dub():
     assert job.burn_subtitles is True
     assert job.hide_source_subtitles is False
     assert job.dub is True
+    assert not hasattr(job, "tts_secondary_voice")
+    assert not hasattr(job, "voice_overrides")
     assert job.original_audio_volume == 0.08
+
+
+def test_single_narrator_keeps_speaker_boundaries_for_timing():
+    cues = [
+        srt.Subtitle(1, timedelta(seconds=0), timedelta(seconds=1), "Ta không biết"),
+        srt.Subtitle(2, timedelta(seconds=1), timedelta(seconds=2), "ngươi nói gì"),
+        srt.Subtitle(3, timedelta(seconds=2), timedelta(seconds=3), "Vậy đi thôi"),
+    ]
+    units = sentence_aligned_utterances(cues, {1: "SPEAKER_00", 2: "SPEAKER_00", 3: "SPEAKER_01"})
+    assert [cue_ids for _, _, cue_ids in units] == [[1, 2], [3]]
 
 
 def test_single_upload_ui_uses_branded_batch_pipeline():
@@ -201,9 +256,45 @@ def test_download_ack_requires_exact_output_size(monkeypatch, tmp_path):
     with pytest.raises(HTTPException) as mismatch:
         main.confirm_batch_download("batch-1", BatchDownloadAck(size_bytes=3))
     assert mismatch.value.status_code == 409
-    result = main.confirm_batch_download("batch-1", BatchDownloadAck(size_bytes=output.stat().st_size))
+    output_size = output.stat().st_size
+    result = main.confirm_batch_download("batch-1", BatchDownloadAck(size_bytes=output_size))
     assert result == row
-    assert updates[-1][1]["download_confirmed_bytes"] == output.stat().st_size
+    assert updates[-1][1]["download_confirmed_bytes"] == output_size
+    assert not output.exists()
+
+
+def test_completed_job_cleanup_keeps_only_deliverable_media(tmp_path):
+    source = tmp_path / "source.mp4"
+    final = tmp_path / "vi-dubbed.mp4"
+    burned = tmp_path / "vi-burned.mp4"
+    source.write_bytes(b"source")
+    final.write_bytes(b"final")
+    burned.write_bytes(b"intermediate")
+    tts_dir = tmp_path / "tts"
+    tts_dir.mkdir()
+    (tts_dir / "clip.wav").write_bytes(b"audio")
+    removed = cleanup_completed_job_media(tmp_path, final)
+    assert final.read_bytes() == b"final"
+    assert not source.exists() and not burned.exists() and not tts_dir.exists()
+    assert set(removed) == {"source.mp4", "vi-burned.mp4", "tts/"}
+
+
+def test_batch_cleanup_removes_episode_media_but_keeps_reports(monkeypatch, tmp_path):
+    jobs = tmp_path / "jobs"
+    episode = jobs / "job-1"
+    episode.mkdir(parents=True)
+    (episode / "vi-dubbed.mp4").write_bytes(b"video")
+    (episode / "source.srt").write_text("metadata")
+    tts_dir = episode / "tts"
+    tts_dir.mkdir()
+    (tts_dir / "clip.wav").write_bytes(b"audio")
+    settings = SimpleNamespace(jobs_dir=jobs)
+    monkeypatch.setattr(batching, "get_settings", lambda: settings)
+    removed = cleanup_combined_episode_media([{"id": "job-1"}])
+    assert not (episode / "vi-dubbed.mp4").exists()
+    assert not tts_dir.exists()
+    assert (episode / "source.srt").read_text() == "metadata"
+    assert len(removed) == 2
 
 
 def test_concat_videos_normalizes_different_episode_sizes(tmp_path):
@@ -322,6 +413,82 @@ def test_translation_json_parsing_and_validation():
         parse_translation_json('[{"id":1,"text":"Xin"},{"id":3,"text":"Chào"}]', [1, 2], allow_missing=True)
 
 
+def test_qwen3_asr_adapter_writes_aligned_srt(monkeypatch, tmp_path):
+    import app.speech_pipeline as pipeline
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video")
+    fake_python = tmp_path / "python"
+    fake_script = tmp_path / "qwen3_asr.py"
+    fake_python.touch()
+    fake_script.touch()
+
+    def fake_run(command, **_kwargs):
+        output = Path(command[3])
+        output.parent.mkdir(exist_ok=True)
+        output.write_text(json.dumps({
+            "elapsed_seconds": 2.5,
+            "word_segments": [
+                {"word": "你", "start": 0.2, "end": 0.5, "score": 1.0},
+                {"word": "好", "start": 0.5, "end": 0.8, "score": 1.0},
+            ],
+        }), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(pipeline, "QWEN3_PYTHON", fake_python)
+    monkeypatch.setattr(pipeline, "QWEN3_SCRIPT", fake_script)
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    messages = []
+    subtitles, speakers = pipeline.transcribe_aligned(
+        video, tmp_path / "source.srt", "qwen3-asr-1.7b", "zh",
+        False, None, None, messages.append,
+    )
+    assert [cue.content for cue in subtitles] == ["你好"]
+    assert speakers == {}
+    assert read_srt(tmp_path / "source.srt")[0].content == "你好"
+    assert any("aligned 2 characters" in message for message in messages)
+
+
+def test_qwen3_asr_falls_back_to_whisper_when_unaligned(monkeypatch, tmp_path):
+    import app.speech_pipeline as pipeline
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video")
+    fake_python = tmp_path / "python"
+    fake_script = tmp_path / "qwen3_asr.py"
+    fake_whisper = tmp_path / "bin" / "whisperx"
+    fake_whisper.parent.mkdir()
+    for path in (fake_python, fake_script, fake_whisper):
+        path.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if command[0] == str(fake_python):
+            output = Path(command[3])
+            output.parent.mkdir(exist_ok=True)
+            output.write_text(json.dumps({"word_segments": []}), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, stdout="2.0\n", stderr="")
+        output = tmp_path / "whisperx" / "source.json"
+        output.parent.mkdir(exist_ok=True)
+        output.write_text(json.dumps({
+            "word_segments": [{"word": "你好", "start": 0.2, "end": 0.8}],
+        }), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(pipeline, "QWEN3_PYTHON", fake_python)
+    monkeypatch.setattr(pipeline, "QWEN3_SCRIPT", fake_script)
+    monkeypatch.setattr(pipeline, "WHISPERX_BIN", fake_whisper)
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    messages = []
+    subtitles, _ = pipeline.transcribe_aligned(
+        video, tmp_path / "source.srt", "qwen3-asr-1.7b", "zh",
+        False, None, None, messages.append,
+    )
+    assert [cue.content for cue in subtitles] == ["你好"]
+    assert any("falling back to WhisperX" in message for message in messages)
+
+
 def test_asr_coverage_guard_catches_nearly_empty_long_video():
     payload = {"word_segments": [{"word": "呃", "start": 14.037, "end": 14.058}]}
     metrics = _transcript_metrics(payload, 115.067)
@@ -417,6 +584,14 @@ def test_qa_allows_only_short_latin_asr_noise(tmp_path):
     assert unsafe["summary"]["error"] == 1
 
 
+def test_qa_blocks_any_chinese_fragment_in_vietnamese_output(tmp_path):
+    from app.qa import validate_job
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "Có ra dáng长辈 không?")
+    report = validate_job(tmp_path, [cue], [1], None)
+    check = next(item for item in report["checks"] if item["name"] == "untranslated_text")
+    assert check["severity"] == "error"
+
+
 def test_translation_over_budget_is_deferred_to_dialogue_timing(monkeypatch, tmp_path):
     settings = get_settings().model_copy(update={"translation_scene_review": False})
     monkeypatch.setattr("app.translator.get_settings", lambda: settings)
@@ -498,11 +673,145 @@ def test_translation_recovers_only_ids_omitted_by_provider(monkeypatch, tmp_path
     assert "Recovered omitted translation ids: [2]" in messages
 
 
+def test_translation_repairs_empty_real_dialogue(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"translation_scene_review": False})
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    responses = iter([
+        '{"translations":[{"id":1,"text":""},{"id":2,"text":"Được rồi."}]}',
+        '{"translations":[{"id":1,"text":"Xin chào."}]}',
+    ])
+    monkeypatch.setattr("app.translator._openai_compatible", lambda *_: next(responses))
+    cues = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "你好"),
+        srt.Subtitle(2, timedelta(seconds=2), timedelta(seconds=4), "好了"),
+    ]
+    result = translate_subtitles(cues, "deepseek", "Chinese", "Vietnamese", job_dir=tmp_path)
+    assert [cue.content for cue in result] == ["Xin chào.", "Được rồi."]
+
+
+def test_translation_retries_even_one_remaining_chinese_fragment(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"translation_scene_review": False})
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    responses = iter([
+        '{"translations":[{"id":1,"text":"Có ra dáng长辈 không?"}]}',
+        '{"translations":[{"id":1,"text":"Có ra dáng bậc trưởng bối không?"}]}',
+    ])
+    monkeypatch.setattr("app.translator._openai_compatible", lambda *_: next(responses))
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "有你这么当长辈的")
+    result = translate_subtitles([cue], "deepseek", "Chinese", "Vietnamese", job_dir=tmp_path)
+    assert result[0].content == "Có ra dáng bậc trưởng bối không?"
+
+
+def test_translation_allows_empty_tiny_asr_noise(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"translation_scene_review": False})
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    monkeypatch.setattr(
+        "app.translator._openai_compatible",
+        lambda *_: '{"translations":[{"id":1,"text":""},{"id":2,"text":"Được rồi."}]}',
+    )
+    cues = [
+        srt.Subtitle(1, timedelta(0), timedelta(milliseconds=100), "。"),
+        srt.Subtitle(2, timedelta(milliseconds=100), timedelta(seconds=2), "好了"),
+    ]
+    result = translate_subtitles(cues, "deepseek", "Chinese", "Vietnamese", job_dir=tmp_path)
+    assert [cue.content for cue in result] == ["", "Được rồi."]
+
+
+def test_token_efficient_translation_uses_scene_sized_batches(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={
+        "translation_batch_size": 30, "translation_scene_review": False,
+    })
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    calls = []
+
+    def provider(_provider, _system, _prompt):
+        offset = len(calls) * 30
+        ids = list(range(offset + 1, min(61, offset + 30) + 1))
+        calls.append(ids)
+        return json.dumps({"translations": [{"id": item_id, "text": f"Câu {item_id}."} for item_id in ids]})
+
+    monkeypatch.setattr("app.translator._openai_compatible", provider)
+    cues = [
+        srt.Subtitle(item_id, timedelta(seconds=item_id * 2), timedelta(seconds=item_id * 2 + 2), f"第{item_id}句")
+        for item_id in range(1, 62)
+    ]
+    translated = translate_subtitles(cues, "deepseek", "Chinese", "Vietnamese", job_dir=tmp_path)
+    assert len(translated) == 61
+    assert calls == [list(range(1, 31)), list(range(31, 61)), [61]]
+
+
+def test_translation_prompt_never_routes_by_technical_speaker_label(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"translation_scene_review": False})
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    prompts = []
+
+    def provider(_provider, _system, prompt):
+        prompts.append(prompt)
+        return '{"translations":[{"id":1,"text":"Em hiểu rồi."}]}'
+
+    monkeypatch.setattr("app.translator._openai_compatible", provider)
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "我知道了")
+    translate_subtitles(
+        [cue], "deepseek", "Chinese", "Vietnamese",
+        speakers={1: "SPEAKER_07"}, job_dir=tmp_path,
+    )
+    assert len(prompts) == 1
+    assert "SPEAKER_07" not in prompts[0]
+    assert '"speaker"' not in prompts[0]
+
+
+def test_translation_prompt_targets_romance_drama_deepseek_style(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"translation_scene_review": False})
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    calls = []
+
+    def provider(_provider, system, prompt):
+        calls.append((system, prompt))
+        return '{"translations":[{"id":1,"text":"Anh đừng rời xa em."}]}'
+
+    monkeypatch.setattr("app.translator._openai_compatible", provider)
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "你不要离开我")
+    translate_subtitles([cue], "deepseek", "Chinese", "Vietnamese", job_dir=tmp_path)
+    system, prompt = calls[0]
+    assert "Chinese romance short dramas" in system
+    assert "DeepSeek reminder" in system
+    assert "avoid literal Chinese syntax" in system
+    assert "faithful to original timing and plot" in prompt
+
+
+def test_ai_usage_ledger_records_tokens_and_estimated_cost(tmp_path):
+    start_ai_usage(tmp_path, "deepseek")
+    _record_usage("deepseek", "deepseek-v4-flash", {
+        "prompt_tokens": 1_000, "prompt_cache_hit_tokens": 200,
+        "prompt_cache_miss_tokens": 800, "completion_tokens": 500,
+        "total_tokens": 1_500,
+    })
+    report = json.loads((tmp_path / "ai-usage.json").read_text(encoding="utf-8"))
+    assert report["requests"] == 1
+    assert report["total_tokens"] == 1_500
+    assert report["prompt_cache_hit_tokens"] == 200
+    assert report["estimated_cost_usd"] > 0
+
+
+def test_dialogue_master_defaults_to_local_reflow(monkeypatch):
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "Xin chào.")
+    monkeypatch.setattr(
+        "app.translator._openai_compatible",
+        lambda *_: (_ for _ in ()).throw(AssertionError("production should not call AI dialogue master")),
+    )
+    display, utterances, warning = build_dialogue_master([cue], [cue], {}, "deepseek")
+    assert warning is None
+    assert display[0].content == "Xin chào."
+    assert utterances[0].full_text == "Xin chào."
+
+
 def test_safe_job_path(monkeypatch, tmp_path: Path):
     settings = get_settings().model_copy(update={"jobs_dir": tmp_path})
     monkeypatch.setattr("app.jobs.get_settings", lambda: settings)
-    expected = (tmp_path / "abc" / "source.mp4").resolve()
-    assert safe_job_file("abc", "source.mp4") == expected
+    expected = (tmp_path / "abc" / "vi-dubbed.mp4").resolve()
+    assert safe_job_file("abc", "vi-dubbed.mp4") == expected
+    with pytest.raises(ValueError):
+        safe_job_file("abc", "source.mp4")
     with pytest.raises(ValueError):
         safe_job_file("abc", "../jobs.sqlite3")
 
@@ -517,7 +826,24 @@ def test_uploaded_mp4_is_saved_before_job_is_queued(monkeypatch, tmp_path):
     output = tmp_path / row["id"] / "source.mp4"
     assert output.read_bytes() == b"x" * 2048
     assert row["url"] == "upload://clip.mp4"
+    assert row["received_bytes"] == 2048
+    assert row["sha256"] == hashlib.sha256(b"x" * 2048).hexdigest()
     assert worker.queue.get_nowait() == row["id"]
+
+
+def test_uploaded_mp4_can_wait_for_batch_finish_before_queue(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"jobs_dir": tmp_path, "max_upload_bytes": 4096})
+    monkeypatch.setattr("app.jobs.get_settings", lambda: settings)
+    monkeypatch.setattr("app.jobs.media.probe_duration", lambda _: 1.0)
+    monkeypatch.setattr("app.jobs.db_create_job", lambda values: values)
+    worker = JobWorker()
+    row = worker.submit_upload(
+        JobCreate(url="https://upload.local/source.mp4"), "clip.mp4", BytesIO(b"receipt" * 300),
+        enqueue=False,
+    )
+    assert worker.queue.empty()
+    assert row["received_bytes"] == len(b"receipt" * 300)
+    assert row["sha256"] == hashlib.sha256(b"receipt" * 300).hexdigest()
 
 
 def test_upload_rejects_wrong_extension_and_oversize(monkeypatch, tmp_path):
@@ -634,9 +960,9 @@ def test_tts_audio_is_fitted_close_to_speech_window(tmp_path):
     from pydub import AudioSegment
     original = AudioSegment.silent(duration=2000, frame_rate=44100)
     fitted = _fit_audio_to_window(original, 1600, tmp_path / "cue.mp3")
-    # Natural speech is never accelerated beyond 1.18x, even when the visual
+    # Natural speech is never accelerated beyond 1.12x, even when the visual
     # window would require a harsher 1.25x stretch.
-    assert 1650 <= len(fitted) <= 1750
+    assert 1740 <= len(fitted) <= 1830
 
 
 def test_tts_audio_is_never_slow_stretched(tmp_path):
@@ -646,12 +972,12 @@ def test_tts_audio_is_never_slow_stretched(tmp_path):
     assert len(fitted) == 1200
 
 
-def test_tts_uses_silence_before_next_utterance():
+def test_tts_uses_only_small_slack_before_next_utterance():
     cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "Xin chào.")
     plan = build_speech_plans([(cue, "A")], 5000)[0]
     assert plan.target_duration_ms == 2000
     assert plan.hard_deadline_ms == 5000
-    assert _available_speech_window_ms(plan) == 4640
+    assert _available_speech_window_ms(plan) == 2460
 
 
 def test_tts_trims_only_edge_padding():

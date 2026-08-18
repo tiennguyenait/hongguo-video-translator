@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from pydantic import ValidationError
 from fastapi.responses import FileResponse
 
 from . import batching
-from .database import delete_job, get_batch, get_batch_jobs, get_job, init_db, list_jobs, recover_interrupted_jobs, update_batch
+from .database import delete_job, get_batch, get_batch_jobs, get_job, init_db, list_jobs, recover_interrupted_jobs, remove_batch_job, update_batch
 from .jobs import apply_subtitle_review, job_directory, remove_job_files, safe_job_file, serialize_job, worker
 from .models import JobStatus
 from .schemas import BatchDownloadAck, BatchResponse, JobCreate, JobResponse, JobReview
@@ -21,7 +22,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 async def lifespan(_: FastAPI):
     init_db()
     recover_interrupted_jobs()
-    worker.start()
+    if os.getenv("HONGGUO_DISABLE_WORKER", "").strip().lower() not in {"1", "true", "yes"}:
+        worker.start()
     batching.start_batch_recovery_monitor()
     yield
     worker.stop()
@@ -50,7 +52,12 @@ def serialize_batch(row: dict) -> dict:
         "download_confirmed_bytes": row.get("download_confirmed_bytes"),
         "eligible_for_cleanup": bool(row.get("download_confirmed_at") and row["status"] == "done"),
         "episodes": [
-            {"position": item["position"], "filename": item["filename"], "job": serialize_job(item)}
+            {
+                "batch_id": item["batch_id"], "position": item["position"],
+                "filename": item["filename"], "received_bytes": item.get("received_bytes"),
+                "sha256": item.get("sha256"), "job_id": item["id"],
+                "job": serialize_job(item),
+            }
             for item in episodes
         ],
     }
@@ -140,10 +147,14 @@ def create_folder_upload(
         if logo and logo.filename:
             batching.save_batch_logo(batch["id"], logo.file)
         for position, video in enumerate(ordered, 1):
-            row = worker.submit_upload(request, video.filename or f"episode-{position}.mp4", video.file)
+            row = worker.submit_upload(
+                request, video.filename or f"episode-{position}.mp4", video.file, enqueue=False,
+            )
             batching.attach_job(batch["id"], row["id"], position, video.filename or f"episode-{position}.mp4")
             video.file.close()
         update_batch(batch["id"], status="queued", progress_message=f"Queued {len(ordered)} episodes in filename order", error=None)
+        for episode in get_batch_jobs(batch["id"]):
+            worker.enqueue(episode["id"])
         batching.finalize_batch_for_job(row["id"])
         return serialize_batch(get_batch(batch["id"]))
     except batching.InsufficientStorageError as exc:
@@ -158,6 +169,43 @@ def create_folder_upload(
             video.file.close()
         if logo:
             logo.file.close()
+
+
+@app.post("/api/batches/{batch_id}/positions/{position}/replace", response_model=BatchResponse)
+def replace_batch_position(
+    batch_id: str, position: int, video: UploadFile = File(...), options: str = Form("{}"),
+):
+    batch = get_batch(batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    if batch["status"] != "uploading":
+        raise HTTPException(409, "Only an uploading batch can replace an episode")
+    expected = int(batch.get("expected_episodes") or 0)
+    if position < 1 or position > expected:
+        raise HTTPException(400, "Position is outside the batch range")
+    old = next((item for item in get_batch_jobs(batch_id) if item["position"] == position), None)
+    if old and old["status"] == "running":
+        raise HTTPException(409, "Episode is currently processing; retry replacement after it stops")
+    try:
+        batching.require_upload_capacity(int(video.size or 0))
+        payload = json.loads(options)
+        if not isinstance(payload, dict):
+            raise ValueError("Upload options must be a JSON object")
+        payload.pop("url", None); payload.pop("channel_name", None); payload.pop("watermark_opacity", None)
+        request = JobCreate(url="https://upload.local/source.mp4", **payload)
+        # Validate and persist the replacement before removing the old receipt.
+        row = worker.submit_upload(request, video.filename or f"episode-{position}.mp4", video.file, enqueue=False)
+        if old:
+            removed = remove_batch_job(batch_id, position)
+            if removed:
+                import shutil
+                shutil.rmtree(job_directory(removed["id"]), ignore_errors=True)
+        batching.attach_job(batch_id, row["id"], position, video.filename or f"episode-{position}.mp4")
+        return serialize_batch(get_batch(batch_id))
+    except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+        raise HTTPException(413 if "5 GiB" in str(exc) else 400, str(exc)) from exc
+    finally:
+        video.file.close()
 
 
 @app.post("/api/batches/start", response_model=BatchResponse, status_code=201)
@@ -231,7 +279,9 @@ def upload_batch_chunk(
         if invalid:
             raise ValueError(f"Positions are not MP4 files: {invalid}")
         for position, video in zip(requested_positions, videos):
-            row = worker.submit_upload(request, video.filename or f"episode-{position}.mp4", video.file)
+            row = worker.submit_upload(
+                request, video.filename or f"episode-{position}.mp4", video.file, enqueue=False,
+            )
             batching.attach_job(batch_id, row["id"], position, video.filename or f"episode-{position}.mp4")
         uploaded = len(get_batch_jobs(batch_id))
         update_batch(batch_id, progress_message=f"Uploaded {uploaded}/{expected} episodes in resumable chunks", error=None)
@@ -254,7 +304,12 @@ def finish_chunked_batch(batch_id: str):
     expected = int(batch.get("expected_episodes") or 0)
     if len(episodes) != expected:
         raise HTTPException(409, f"Uploaded {len(episodes)}/{expected} episodes")
+    missing_receipts = [item["position"] for item in episodes if not item.get("received_bytes") or not item.get("sha256")]
+    if missing_receipts:
+        raise HTTPException(409, f"Upload receipts missing for positions: {missing_receipts}")
     update_batch(batch_id, status="queued", progress_message=f"Uploaded all {expected} episodes; processing sequentially", error=None)
+    for episode in episodes:
+        worker.enqueue(episode["id"])
     batching.finalize_batch_for_job(episodes[-1]["id"])
     return serialize_batch(get_batch(batch_id))
 
@@ -299,6 +354,9 @@ def confirm_batch_download(batch_id: str, request: BatchDownloadAck):
         raise HTTPException(409, f"Downloaded size mismatch: local={request.size_bytes}, server={actual_size}")
     from .database import utc_now
     update_batch(batch_id, download_confirmed_at=utc_now(), download_confirmed_bytes=actual_size)
+    # The local client has verified the exact byte count. Keeping another
+    # multi-gigabyte server copy only blocks subsequent uploads.
+    path.unlink()
     return serialize_batch(get_batch(batch_id))
 
 

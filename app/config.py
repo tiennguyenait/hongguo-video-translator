@@ -13,11 +13,20 @@ class Settings(BaseModel):
     data_dir: Path = SERVER_DIR / "data"
     jobs_dir: Path = SERVER_DIR / "data" / "jobs"
     database_path: Path = SERVER_DIR / "data" / "jobs.sqlite3"
-    translation_batch_size: int = 15
+    # One scene-sized request avoids paying the prompt overhead for every 15
+    # display lines while remaining small enough for reliable structured JSON.
+    translation_batch_size: int = 30
     translation_retries: int = 3
     translation_context_before: int = 6
     translation_context_after: int = 4
-    translation_scene_review: bool = True
+    # The primary translation prompt already edits the batch as a coherent
+    # scene. Re-reading every line in a second pass doubles token use.
+    # Optional expensive editorial passes. They remain opt-in so existing jobs
+    # do not unexpectedly double their LLM usage; the safer resegmentation and
+    # speaker/timing fixes are enabled independently below.
+    translation_scene_review: bool = False
+    dialogue_master_ai_repair: bool = False
+    ai_prosody_enabled: bool = False
     tts_cache_dir: Path = SERVER_DIR / "data" / "cache" / "tts"
     vieneu_python: Path = Path("/workspace/vieneu-tts/.venv/bin/python")
     vieneu_runner: Path = SERVER_DIR / "scripts" / "vieneu_batch.py"

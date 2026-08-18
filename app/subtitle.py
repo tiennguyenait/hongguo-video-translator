@@ -19,7 +19,20 @@ def segments_to_subtitles(segments: Iterable[Any]) -> list[srt.Subtitle]:
 
 
 def write_srt(path: Path, subtitles: list[srt.Subtitle]) -> None:
-    path.write_text(srt.compose(subtitles), encoding="utf-8")
+    # ASR can legitimately produce an empty punctuation/noise cue. Reindexing
+    # after srt drops that cue shifts every later id and makes voice-aligned QA
+    # report a false mismatch. Keep source-owned ids stable; empty cues remain
+    # represented by an empty SRT block, while every later cue retains its id.
+    path.write_text(srt.compose(subtitles, reindex=False), encoding="utf-8")
+
+
+def is_ignorable_asr_fragment(cue: srt.Subtitle) -> bool:
+    """Return true only for tiny ASR artifacts that may safely be silent."""
+    compact = re.sub(r"[^\w\u3400-\u9fff]", "", cue.content, flags=re.UNICODE)
+    duration = (cue.end - cue.start).total_seconds()
+    return len(compact) <= 1 or (
+        duration <= 0.5 and re.fullmatch(r"[A-Za-z]{1,3}", compact) is not None
+    )
 
 
 def read_srt(path: Path) -> list[srt.Subtitle]:

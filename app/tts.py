@@ -1,23 +1,29 @@
-import asyncio
 import json
 import re
 import subprocess
 import shutil
 from pathlib import Path
 
-import edge_tts
 import srt
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
 
 from .media import mux_delayed_clips, probe_duration
 from .config import get_settings
-from .voice_profiles import classify_speaker_voices
 from .artifacts import atomic_write_json, stable_hash
-from .speech_plan import build_speech_plans, predict_duration_ms, punctuation_pause_after_ms
+from .speech_plan import (
+    MAX_ORIGINAL_TIMING_DRIFT_MS,
+    MAX_ORIGINAL_TIMING_DRIFT_RATIO,
+    build_speech_plans,
+    predict_duration_ms,
+    punctuation_pause_after_ms,
+)
 from .prosody import PROSODY_VERSION, plan_prosody
 
-MAX_NATURAL_TEMPO = 1.18
+# Keep dubbing close to the original delivery. If Vietnamese cannot fit within
+# this mild acceleration, the line should be shortened upstream or flagged by QA
+# instead of being spoken unnaturally fast.
+MAX_NATURAL_TEMPO = 1.12
 
 
 def sentence_aligned_utterances(
@@ -37,9 +43,13 @@ def sentence_aligned_utterances(
     for cue in subtitles:
         if current:
             previous_complete = bool(re.search(r'[.!?…]["”’)]?\s*$', current[-1].content.strip()))
+            previous_speaker = speakers.get(current[-1].index)
+            current_speaker = speakers.get(cue.index)
+            speaker_changed = bool(previous_speaker and current_speaker and previous_speaker != current_speaker)
             # SRT timing gaps and visual line wraps are not linguistic stops.
-            # Only punctuation in the actual dialogue may end a spoken phrase.
-            if previous_complete:
+            # Punctuation ends a spoken phrase; speaker changes are retained as
+            # timing boundaries even when the final audio uses one narrator voice.
+            if previous_complete or speaker_changed:
                 first, last = current[0], current[-1]
                 result.append((
                     srt.Subtitle(first.index, first.start, last.end, " ".join(item.content.strip() for item in current)),
@@ -114,9 +124,10 @@ def _trim_edge_silence(audio: AudioSegment) -> AudioSegment:
 
 
 def _available_speech_window_ms(plan) -> int:
-    """Use real silence before the next utterance while reserving punctuation pauses."""
+    """Use a small amount of real silence, while staying close to source timing."""
     deadline_window = plan.hard_deadline_ms - plan.pause_before_ms - plan.pause_after_ms
-    return max(plan.target_duration_ms, deadline_window)
+    soft_window = round(plan.target_duration_ms * MAX_ORIGINAL_TIMING_DRIFT_RATIO) + MAX_ORIGINAL_TIMING_DRIFT_MS
+    return max(plan.target_duration_ms, min(deadline_window, soft_window))
 
 
 def _fit_audio_to_window(audio: AudioSegment, target_ms: int, work_path: Path) -> AudioSegment:
@@ -143,30 +154,6 @@ def _fit_audio_to_window(audio: AudioSegment, target_ms: int, work_path: Path) -
     fitted = AudioSegment.from_file(output_path)
     output_path.unlink(missing_ok=True)
     return fitted.fade_in(20).fade_out(35)
-
-
-async def _synthesize(cue: srt.Subtitle, voice: str, path: Path, narrator_mode: bool = False) -> None:
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            path.unlink(missing_ok=True)
-            clean_text = re.sub(r"\s+", " ", cue.content).strip()
-            await asyncio.wait_for(
-                edge_tts.Communicate(
-                    clean_text, voice,
-                    rate="+4%" if narrator_mode else "+10%",
-                    pitch="-8Hz" if narrator_mode else "+0Hz",
-                ).save(str(path)),
-                timeout=45,
-            )
-            if path.is_file() and path.stat().st_size >= 512:
-                return
-            raise RuntimeError("Edge TTS returned an empty or truncated MP3")
-        except Exception as exc:
-            last_error = exc
-            if attempt < 3:
-                await asyncio.sleep(attempt * 2)
-    raise RuntimeError(f"Edge TTS failed for cue {cue.index} after 3 attempts: {last_error}")
 
 
 def build_utterances(subtitles: list[srt.Subtitle], speakers: dict[int, str]) -> list[tuple[srt.Subtitle, str | None]]:
@@ -251,9 +238,6 @@ def _synthesize_local_batch(items: list[dict], voice: str, clips_dir: Path) -> N
 def create_dub(
     video: Path, subtitles: list[srt.Subtitle], job_dir: Path, voice: str,
     original_audio_volume: float, progress=None, speakers: dict[int, str] | None = None,
-    secondary_voice: str = "vi-VN-NamMinhNeural",
-    voice_overrides: dict[str, str] | None = None,
-    narrator_mode: bool = True,
     provider: str = "deepseek",
     master_utterances: list[dict] | None = None,
 ) -> Path:
@@ -263,17 +247,13 @@ def create_dub(
     (job_dir / "vi-dub.wav").unlink(missing_ok=True)
     video_duration_ms = int(probe_duration(video) * 1000)
     speakers = speakers or {}
-    if narrator_mode:
-        profiles = {
-            label: {"mode": "single_narrator", "voice": voice, "overridden": False}
-            for label in sorted(set(speakers.values()))
-        }
-        (job_dir / "voice-profiles.json").write_text(
-            __import__("json").dumps(profiles or {"NARRATOR": {"mode": "single_narrator", "voice": voice}}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    else:
-        profiles = classify_speaker_voices(video, subtitles, speakers, voice, secondary_voice, voice_overrides)
+    atomic_write_json(job_dir / "voice-profiles.json", {
+        "NARRATOR": {
+            "mode": "single_narrator",
+            "voice": voice,
+            "speaker_boundaries": "used_for_timing_only",
+        },
+    })
     # Display-line boundaries must not create artificial TTS pauses. Build
     # complete phrases from the final punctuated SRT, without trusting the
     # dialogue master's punctuation-normalized full_text.
@@ -281,7 +261,7 @@ def create_dub(
     utterances = [(cue, speaker) for cue, speaker, _ in sentence_units]
     plans = build_speech_plans(utterances, video_duration_ms)
     prosody_warning = None
-    if narrator_mode:
+    if get_settings().ai_prosody_enabled:
         plans, prosody_warning = plan_prosody(plans, provider)
     for plan in plans:
         # Provider direction may add a longer dramatic pause, but it must not
@@ -292,8 +272,7 @@ def create_dub(
         "items": [plan.to_dict() for plan in plans],
     })
     atomic_write_json(job_dir / "speech-plan.json", [plan.to_dict() for plan in plans])
-    if narrator_mode:
-        _synthesize_local_batch([{"id": plan.id, "text": plan.spoken_text, "style": plan.style} for plan in plans], voice, clips_dir)
+    _synthesize_local_batch([{"id": plan.id, "text": plan.spoken_text, "style": plan.style} for plan in plans], voice, clips_dir)
     fitted_dir = clips_dir / "fitted"
     fitted_dir.mkdir(exist_ok=True)
     delayed_clips: list[tuple[Path, int]] = []
@@ -302,10 +281,7 @@ def create_dub(
     for number, (cue, speaker) in enumerate(utterances, 1):
         plan = plans[number - 1]
         cue_ids = sentence_units[number - 1][2]
-        clip_path = clips_dir / f"{cue.index:06d}.{'wav' if narrator_mode else 'mp3'}"
-        cue_voice = profiles.get(speaker, {}).get("voice", voice)
-        if not narrator_mode:
-            asyncio.run(_synthesize(cue, cue_voice, clip_path, narrator_mode))
+        clip_path = clips_dir / f"{cue.index:06d}.wav"
         audio = AudioSegment.from_file(clip_path)
         raw_original_ms = len(audio)
         audio = _trim_edge_silence(audio)

@@ -1,4 +1,5 @@
 import logging
+import hashlib
 import json
 import os
 import queue
@@ -16,7 +17,7 @@ from .artifacts import atomic_write_json
 from .dialogue import build_dialogue_units, repair_fragment_speakers
 from .config import get_settings
 from .database import create_job as db_create_job
-from .database import get_job, list_jobs, update_job, utc_now
+from .database import get_batch, get_job, get_job_batch, list_jobs, update_job, utc_now
 from .models import JobStatus, JobStep
 from .schemas import JobCreate
 from .subtitle import read_srt, write_srt
@@ -24,15 +25,32 @@ from .source_subtitle_mask import SubtitleRegion, detect_source_subtitle_regions
 
 logger = logging.getLogger(__name__)
 OUTPUT_NAMES = {
-    "video": "source.mp4", "source_srt": "source.srt", "translated_srt": "vi.srt",
+    "source_srt": "source.srt", "translated_srt": "vi.srt",
     "burned_video": "vi-burned.mp4", "dubbed_video": "vi-dubbed.mp4",
     "speaker_report": "voice-profiles.json",
     "qa_report": "qa-report.json",
     "subtitle_regions": "subtitle-regions.json",
     "subtitle_layout": "subtitle-layout.json",
     "aligned_srt": "vi-aligned.srt",
+    "ai_usage": "ai-usage.json",
 }
 UPLOAD_EXTENSIONS = {".mp4"}
+
+
+def cleanup_completed_job_media(directory: Path, final_video: Path) -> list[str]:
+    """Keep only the deliverable video; remove source and render scratch media."""
+    removed: list[str] = []
+    for name in ("source.mp4", "vi-burned.mp4", "speaker-analysis.wav", "vi-dub.wav"):
+        path = directory / name
+        if path == final_video or not path.exists():
+            continue
+        path.unlink()
+        removed.append(name)
+    tts_dir = directory / "tts"
+    if tts_dir.is_dir():
+        shutil.rmtree(tts_dir)
+        removed.append("tts/")
+    return removed
 
 
 def job_directory(job_id: str) -> Path:
@@ -57,6 +75,7 @@ def serialize_job(row: dict[str, Any]) -> dict[str, Any]:
         "id": job_id, "url": row["url"], "status": row["status"], "step": row["step"],
         "progress_message": row["progress_message"], "error": row["error"],
         "provider": row["provider"], "asr_model": row["asr_model"],
+        "received_bytes": row.get("received_bytes"), "sha256": row.get("sha256"),
         "diarize": bool(row.get("diarize", 0)),
         "burn_subtitles": bool(row["burn_subtitles"]), "hide_source_subtitles": bool(row.get("hide_source_subtitles", 0)), "dub": bool(row["dub"]),
         "created_at": row["created_at"], "updated_at": row["updated_at"], "outputs": outputs,
@@ -78,7 +97,9 @@ class JobWorker:
         self.thread = threading.Thread(target=self._loop, name="hongguo-job-worker", daemon=True)
         self.thread.start()
         for row in reversed(list_jobs(1000)):
-            if row["status"] == JobStatus.QUEUED:
+            batch_id = get_job_batch(row["id"])
+            batch = get_batch(batch_id) if batch_id else None
+            if row["status"] == JobStatus.QUEUED and (not batch or batch["status"] != "uploading"):
                 self.queue.put(row["id"])
 
     def stop(self) -> None:
@@ -87,7 +108,10 @@ class JobWorker:
         if self.thread:
             self.thread.join(timeout=10)
 
-    def _submit(self, request: JobCreate, job_id: str | None = None) -> dict[str, Any]:
+    def _submit(
+        self, request: JobCreate, job_id: str | None = None, *,
+        received_bytes: int | None = None, sha256: str | None = None, enqueue: bool = True,
+    ) -> dict[str, Any]:
         job_id, now = job_id or str(uuid.uuid4()), utc_now()
         values = {
             "id": job_id, "url": request.url, "status": JobStatus.QUEUED, "step": JobStep.QUEUED,
@@ -97,21 +121,25 @@ class JobWorker:
             "source_language": request.source_language, "target_language": request.target_language,
             "glossary": request.glossary, "burn_subtitles": int(request.burn_subtitles), "dub": int(request.dub),
             "hide_source_subtitles": int(request.hide_source_subtitles),
-            "narrator_mode": int(request.narrator_mode),
-            "tts_voice": request.tts_voice, "tts_secondary_voice": request.tts_secondary_voice,
-            "voice_overrides": json.dumps(request.voice_overrides),
+            "narrator_mode": 1,
+            "tts_voice": request.tts_voice, "tts_secondary_voice": request.tts_voice,
+            "voice_overrides": "{}",
             "original_audio_volume": request.original_audio_volume,
+            "received_bytes": received_bytes, "sha256": sha256,
             "created_at": now, "updated_at": now,
         }
         job_directory(job_id).mkdir(parents=True, exist_ok=True)
         row = db_create_job(values)
-        self.queue.put(job_id)
+        if enqueue:
+            self.queue.put(job_id)
         return row
 
     def submit(self, request: JobCreate) -> dict[str, Any]:
         return self._submit(request)
 
-    def submit_upload(self, request: JobCreate, filename: str, stream: BinaryIO) -> dict[str, Any]:
+    def submit_upload(
+        self, request: JobCreate, filename: str, stream: BinaryIO, *, enqueue: bool = True,
+    ) -> dict[str, Any]:
         suffix = Path(filename or "").suffix.lower()
         if suffix not in UPLOAD_EXTENSIONS:
             raise ValueError("Only MP4 uploads are supported")
@@ -121,12 +149,14 @@ class JobWorker:
         temporary = directory / ".source.uploading"
         output = directory / "source.mp4"
         total = 0
+        digest = hashlib.sha256()
         try:
             with temporary.open("wb") as target:
                 while chunk := stream.read(1024 * 1024):
                     total += len(chunk)
                     if total > get_settings().max_upload_bytes:
                         raise ValueError("Uploaded video exceeds the 5 GiB limit")
+                    digest.update(chunk)
                     target.write(chunk)
                 target.flush()
                 os.fsync(target.fileno())
@@ -137,10 +167,16 @@ class JobWorker:
             if duration <= 0:
                 raise ValueError("Uploaded MP4 has no readable video duration")
             upload_request = request.model_copy(update={"url": f"upload://{Path(filename).name}"})
-            return self._submit(upload_request, job_id)
+            return self._submit(
+                upload_request, job_id, received_bytes=total,
+                sha256=digest.hexdigest(), enqueue=enqueue,
+            )
         except Exception:
             shutil.rmtree(directory, ignore_errors=True)
             raise
+
+    def enqueue(self, job_id: str) -> None:
+        self.queue.put(job_id)
 
     def is_active(self, job_id: str) -> bool:
         with self._lock:
@@ -219,7 +255,7 @@ class JobWorker:
         (directory / "dialogue-units.json").write_text(json.dumps([unit.to_dict() for unit in units], ensure_ascii=False, indent=2), encoding="utf-8")
         self._progress(job_id, JobStep.TRANSLATING, f"Translating {len(subtitles)} cues via {job['provider']}")
         translated_srt = directory / "vi.srt"
-        translation_fingerprint = stable_hash({"source": [(cue.index, cue.content) for cue in subtitles], "provider": job["provider"], "target": job["target_language"], "glossary": job["glossary"], "pipeline": "context-v2"})
+        translation_fingerprint = stable_hash({"source": [(cue.index, cue.content) for cue in subtitles], "speakers": speakers, "provider": job["provider"], "target": job["target_language"], "glossary": job["glossary"], "pipeline": "romance-scene-batch-v6-speaker-aware"})
         if manifest.valid("translation", translation_fingerprint, [translated_srt, directory / "vi-final.json"]):
             self._progress(job_id, JobStep.TRANSLATING, "Resuming from context-edited Vietnamese translation")
             resumed_mapping = {
@@ -231,10 +267,12 @@ class JobWorker:
                 for cue in subtitles
             ]
         else:
+            translator.start_ai_usage(directory, job["provider"])
             translated = translator.translate_subtitles(
                 subtitles, job["provider"], job["source_language"], job["target_language"], job["glossary"],
                 lambda message: self._progress(job_id, JobStep.TRANSLATING, message),
-                speakers, directory,
+                speakers=speakers,
+                job_dir=directory,
             )
             write_srt(translated_srt, translated)
             manifest.complete("translation", translation_fingerprint, [translated_srt, directory / "vi-final.json"], {"cues": len(translated)})
@@ -264,7 +302,7 @@ class JobWorker:
         master_path = directory / "dialogue-master.json"
         master_fingerprint = stable_hash({
             "draft": [(cue.index, cue.content) for cue in draft], "source": [(cue.index, cue.content) for cue in subtitles],
-            "speakers": speakers, "provider": job["provider"], "boxes": box_widths, "pipeline": "display-lines-v4-sentence-tts",
+            "speakers": speakers, "provider": job["provider"], "boxes": box_widths, "pipeline": "display-lines-v7-speaker-aware",
         })
         if manifest.valid("dialogue_master", master_fingerprint, [translated_srt, master_path]):
             master_payload = json.loads(master_path.read_text(encoding="utf-8"))
@@ -306,7 +344,7 @@ class JobWorker:
             dub_video_base = video
             dubbed = directory / "vi-dubbed.mp4"
             base_stat = dub_video_base.stat()
-            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "master": master_payload, "video_base": [base_stat.st_size, base_stat.st_mtime_ns], "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "review-master-v6-minus13.5lufs-lra2.5-tp1", "prosody": "conservative-v1", "timing": "punctuated-sentence-v4-sequential-retimed-display", "burn": bool(job["burn_subtitles"]), "mask": [region.to_dict() for region in regions]})
+            dub_fingerprint = stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "master": master_payload, "video_base": [base_stat.st_size, base_stat.st_mtime_ns], "voice_policy": "single-narrator-v1", "voice": job["tts_voice"], "original_audio_volume": job["original_audio_volume"], "mix": "review-master-v6-minus13.5lufs-lra2.5-tp1", "prosody": "local-conservative-v2", "timing": "punctuated-sentence-v6-source-anchored-retimed-display", "burn": bool(job["burn_subtitles"]), "mask": [region.to_dict() for region in regions]})
             dub_outputs = [dubbed, directory / "speech-plan.json", directory / "prosody-plan.json", directory / "tts-timing.json", directory / "vi-aligned.srt"]
             if manifest.valid("dub", dub_fingerprint, dub_outputs):
                 self._progress(job_id, JobStep.DUBBING, "Resuming from cached Vietnamese dub")
@@ -315,10 +353,7 @@ class JobWorker:
                 tts.create_dub(
                     dub_video_base, translated, directory, job["tts_voice"], job["original_audio_volume"],
                     lambda message: self._progress(job_id, JobStep.DUBBING, message),
-                    speakers, job.get("tts_secondary_voice", "vi-VN-NamMinhNeural"),
-                    json.loads(job.get("voice_overrides") or "{}"),
-                    bool(job.get("narrator_mode", 1)),
-                    job["provider"],
+                    speakers, job["provider"],
                     master_payload.get("utterances"),
                 )
                 if job["burn_subtitles"]:
@@ -329,9 +364,23 @@ class JobWorker:
                 manifest.complete("dub", dub_fingerprint, dub_outputs)
         self._progress(job_id, JobStep.QA, "Running automatic content, timing, and media QA")
         final_video = directory / "vi-dubbed.mp4" if job["dub"] else directory / "vi-burned.mp4" if job["burn_subtitles"] else video
+        # Normalize the serialized subtitle artifacts from the authoritative
+        # in-memory cues before QA. This self-heals files written by older code
+        # that renumbered ids after an intentionally empty ASR-noise cue.
+        write_srt(translated_srt, translated)
+        if job["dub"] and (directory / "tts-timing.json").is_file():
+            timing = json.loads((directory / "tts-timing.json").read_text(encoding="utf-8"))
+            write_srt(directory / "vi-aligned.srt", tts.retime_subtitles_to_tts(translated, timing))
         report = qa.validate_job(directory, translated, [cue.index for cue in subtitles], final_video)
         manifest.complete("qa", stable_hash({"translation": [(cue.index, cue.content) for cue in translated], "master": master_payload, "output_bytes": final_video.stat().st_size}), [directory / "qa-report.json"], report["summary"])
         status = JobStatus.NEEDS_REVIEW if report["summary"]["error"] else JobStatus.DONE
+        # A review job must retain its source for rerendering. A successful
+        # translated job keeps only the actual deliverable; uploaded originals
+        # and per-utterance WAV files otherwise accumulate indefinitely.
+        if status == JobStatus.DONE and final_video != video:
+            removed = cleanup_completed_job_media(directory, final_video)
+            if removed:
+                logger.info("job=%s storage cleanup removed=%s", job_id, removed)
         message = f"QA complete: {report['summary']['pass']} passed, {report['summary']['warning']} warnings, {report['summary']['error']} errors"
         update_job(job_id, status=status, step=JobStep.DONE, progress_message=message, error=None)
 

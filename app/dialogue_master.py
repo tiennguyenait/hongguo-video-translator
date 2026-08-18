@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 
 import srt
 
+from .config import get_settings
+
 
 @dataclass(slots=True)
 class MasterUtterance:
@@ -24,7 +26,7 @@ class MasterUtterance:
         return asdict(self)
 
 
-SYSTEM_PROMPT = """You are the final Vietnamese dialogue editor for dubbing Chinese short dramas.
+SYSTEM_PROMPT = """You are the final Vietnamese dialogue editor for dubbing Chinese romance short dramas.
 Create one master dialogue that is used by BOTH subtitles and TTS.
 Return JSON only as:
 {"utterances":[{"cue_ids":[1,2],"full_text":"complete sentence",
@@ -41,6 +43,9 @@ Rules:
 - Never cross a mandatory hard boundary or two different known speakers.
 - Chinese source is authoritative. Draft Vietnamese is a terminology hint and may be wrong.
   Repair ASR boundary characters using the complete source scene and neighboring cues.
+- Keep romance-drama tone natural for Vietnamese viewers: emotional tension, jealousy, family pressure,
+  class/status conflict and relationship distance must sound like spoken Vietnamese, not literal Chinese.
+- Preserve the original plot, timing ownership and character intent. Do not add new facts or exposition.
 - A Chinese character at the start of a cue may grammatically finish the previous sentence even
   across a mandatory timing boundary. Move its MEANING to the previous Vietnamese group while
   keeping the cue id itself in the later group; do not invent a name from that dangling character.
@@ -192,32 +197,41 @@ def build_dialogue_master(
             "source_box_width": (box_widths or {}).get(cue.index),
         })
     warning = None
-    try:
-        if request is None:
-            from .translator import _gemini, _openai_compatible
-            request = lambda selected, system, user: (
-                _gemini(system, user) if selected == "gemini" else _openai_compatible(selected, system, user)
+    # Translation already handles cross-cue continuity. Production therefore
+    # keeps the validated display text and derives sentence groups locally.
+    # Supplying request explicitly (tests/manual repair) or enabling the flag
+    # preserves the expensive AI repair path for exceptional material.
+    use_ai = request is not None or get_settings().dialogue_master_ai_repair
+    if not use_ai:
+        parsed = [
+            {"cue_ids": [cue.index], "full_text": cue.content, "display_texts": [cue.content]}
+            for cue in draft
+        ]
+    else:
+        try:
+            if request is None:
+                from .translator import _gemini, _openai_compatible
+                request = lambda selected, system, user: (
+                    _gemini(system, user) if selected == "gemini" else _openai_compatible(selected, system, user)
+                )
+            user = (
+                "Complete Chinese scene:\n" + "".join(item["source"] for item in prompt_items)
+                + "\nMandatory hard boundaries:\n" + json.dumps(sorted([list(pair) for pair in hard_breaks]))
+                + "\nTimed original display lines:\n" + json.dumps(prompt_items, ensure_ascii=False)
             )
-        user = (
-            "Complete Chinese scene:\n" + "".join(item["source"] for item in prompt_items)
-            + "\nMandatory hard boundaries:\n" + json.dumps(sorted([list(pair) for pair in hard_breaks]))
-            + "\nTimed original display lines:\n" + json.dumps(prompt_items, ensure_ascii=False)
-        )
-        last_error = None
-        for _ in range(2):
-            try:
-                parsed = _parse_master(request(provider, SYSTEM_PROMPT, user), expected_ids, hard_breaks)
-                break
-            except Exception as exc:
-                last_error = exc
-                user += "\nRETRY: Previous JSON was invalid: " + str(exc) + ". Fix it and obey all invariants."
-        else:
-            raise ValueError(f"Dialogue master validation failed twice: {last_error}")
-        master_source = "ai"
-    except Exception as exc:
-        warning = f"Dialogue master unavailable; retained safe draft: {exc}"
-        parsed = [{"cue_ids": [cue.index], "full_text": cue.content, "display_texts": [cue.content]} for cue in draft]
-        master_source = "fallback"
+            last_error = None
+            for _ in range(2):
+                try:
+                    parsed = _parse_master(request(provider, SYSTEM_PROMPT, user), expected_ids, hard_breaks)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    user += "\nRETRY: Previous JSON was invalid: " + str(exc) + ". Fix it and obey all invariants."
+            else:
+                raise ValueError(f"Dialogue master validation failed twice: {last_error}")
+        except Exception as exc:
+            warning = f"Dialogue master unavailable; retained safe draft: {exc}"
+            parsed = [{"cue_ids": [cue.index], "full_text": cue.content, "display_texts": [cue.content]} for cue in draft]
     display_mapping = {
         item_id: text for group in parsed for item_id, text in zip(group["cue_ids"], group["display_texts"], strict=True)
     }
