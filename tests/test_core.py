@@ -30,7 +30,7 @@ from app.source_subtitle_mask import _candidate_boxes
 from app.adaptive_subtitle import FONT_NAME, fit_text, generate_adaptive_ass
 from app.source_subtitle_mask import SubtitleRegion
 from app.dialogue_master import _coalesce_speech_groups, build_dialogue_master
-from app.translator import _record_usage, start_ai_usage, translate_subtitles
+from app.translator import SYSTEM_PROMPT, _record_usage, start_ai_usage, translate_subtitles
 from app.media import (
     AUDIO_BITRATE, NARRATION_LOUDNESS_LUFS, NARRATION_LRA, NARRATION_TRUE_PEAK_DB,
     VIDEO_CRF, _merge_video_encode_args, apply_channel_watermark, concat_videos,
@@ -84,12 +84,72 @@ def test_qa_ignores_aligned_srt_absence_of_safe_empty_asr_cue(tmp_path):
     assert checks["tts_subtitle_sync"] == "pass"
 
 
+def test_qa_warns_for_overlong_tts_source_spans(tmp_path, monkeypatch):
+    from app.qa import validate_job
+    subtitles = [srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "Xin chào.")]
+    monkeypatch.setattr(
+        "app.qa.get_settings", lambda: SimpleNamespace(
+            tts_long_utterance_warning_ms=500, tts_sentence_gap_break_seconds=0.8,
+        ),
+    )
+    (tmp_path / "tts-timing.json").write_text(json.dumps([{
+        "id": 1, "cue_ids": [1], "tempo": 1.0, "overflow_ms": 0, "alignment_mode": "punctuated_sentence",
+        "schedule_shift_ms": 0, "source_span_ms": 1200, "max_internal_gap_ms": 0,
+    }]), encoding="utf-8")
+    report = validate_job(tmp_path, subtitles, [1], None)
+    checks = {item["name"]: item["severity"] for item in report["checks"]}
+    assert checks["tts_source_span"] == "warning"
+
+
+def test_qa_warns_for_large_intra_phrase_gap(tmp_path, monkeypatch):
+    from app.qa import validate_job
+    subtitles = [
+        srt.Subtitle(1, timedelta(0), timedelta(seconds=1), "Một."),
+        srt.Subtitle(2, timedelta(seconds=1.95), timedelta(seconds=2.3), "Hai."),
+    ]
+    monkeypatch.setattr(
+        "app.qa.get_settings", lambda: SimpleNamespace(
+            tts_long_utterance_warning_ms=14000, tts_sentence_gap_break_seconds=0.8,
+        ),
+    )
+    (tmp_path / "tts-timing.json").write_text(json.dumps([{
+        "id": 1,
+        "cue_ids": [1, 2],
+        "tempo": 1.0,
+        "overflow_ms": 0,
+        "alignment_mode": "punctuated_sentence",
+        "schedule_shift_ms": 0,
+        "source_span_ms": 2300,
+        "max_internal_gap_ms": 950,
+    }]), encoding="utf-8")
+    report = validate_job(tmp_path, subtitles, [1, 2], None)
+    checks = {item["name"]: item["severity"] for item in report["checks"]}
+    assert checks["tts_internal_gap"] == "warning"
+
+
+def test_tts_timing_settings_load_from_env(monkeypatch):
+    monkeypatch.setenv("HONGGUO_TTS_SENTENCE_GAP_BREAK_SECONDS", "0.95")
+    monkeypatch.setenv("HONGGUO_TTS_LONG_UTTERANCE_WARNING_MS", "15500")
+    get_settings.cache_clear()
+    try:
+        settings = get_settings()
+        assert settings.tts_sentence_gap_break_seconds == 0.95
+        assert settings.tts_long_utterance_warning_ms == 15500
+    finally:
+        get_settings.cache_clear()
+
+
 def test_vieneu_pauses_follow_vietnamese_punctuation():
     assert split_for_natural_pauses("Chờ một chút, rồi đi tiếp. Được không? Đi thôi!") == [
-        ("Chờ một chút,", 180),
-        ("rồi đi tiếp.", 360),
-        ("Được không?", 320),
-        ("Đi thôi!", 320),
+        ("Chờ một chút,", 210),
+        ("rồi đi tiếp.", 380),
+        ("Được không?", 340),
+        ("Đi thôi!", 340),
+    ]
+    assert split_for_natural_pauses("Ừ,biết rồi!Anh vào đi.") == [
+        ("Ừ,", 210),
+        ("biết rồi!", 340),
+        ("Anh vào đi.", 380),
     ]
 
 
@@ -137,9 +197,15 @@ def test_default_job_keeps_source_subtitles_and_enables_vietnamese_dub():
     assert job.burn_subtitles is True
     assert job.hide_source_subtitles is False
     assert job.dub is True
+    assert job.speaker_gender_profile == "auto"
     assert not hasattr(job, "tts_secondary_voice")
     assert not hasattr(job, "voice_overrides")
     assert job.original_audio_volume == 0.08
+
+
+def test_default_job_allows_explicit_female_single_speaker_profile():
+    explicit = JobCreate(url="https://example.com/video.mp4", speaker_gender_profile="female")
+    assert explicit.speaker_gender_profile == "female"
 
 
 def test_single_narrator_keeps_speaker_boundaries_for_timing():
@@ -757,7 +823,7 @@ def test_translation_prompt_never_routes_by_technical_speaker_label(monkeypatch,
     )
     assert len(prompts) == 1
     assert "SPEAKER_07" not in prompts[0]
-    assert '"speaker"' not in prompts[0]
+    assert '"character_1"' in prompts[0]
 
 
 def test_translation_prompt_targets_romance_drama_deepseek_style(monkeypatch, tmp_path):
@@ -774,9 +840,30 @@ def test_translation_prompt_targets_romance_drama_deepseek_style(monkeypatch, tm
     translate_subtitles([cue], "deepseek", "Chinese", "Vietnamese", job_dir=tmp_path)
     system, prompt = calls[0]
     assert "Chinese romance short dramas" in system
-    assert "DeepSeek reminder" in system
+    assert "localize meaning and character intent" in system
     assert "avoid literal Chinese syntax" in system
     assert "faithful to original timing and plot" in prompt
+
+
+def test_translate_subtitles_rewrites_masculine_vocatives_for_female_single_speaker(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(update={"translation_scene_review": False})
+    monkeypatch.setattr("app.translator.get_settings", lambda: settings)
+    systems = []
+
+    def provider(_provider, system, _prompt):
+        systems.append(system)
+        return '{"translations":[{"id":1,"text":"Anh ấy nói với anh à, đi thôi."}]}'
+
+    monkeypatch.setattr("app.translator._openai_compatible", provider)
+    cue = srt.Subtitle(1, timedelta(0), timedelta(seconds=2), "我愛你")
+    result = translate_subtitles(
+        [cue], "deepseek", "Chinese", "Vietnamese",
+        speakers={1: "SPEAKER_07"},
+        speaker_gender_profile="female",
+        job_dir=tmp_path,
+    )
+    assert systems and systems[0] == SYSTEM_PROMPT
+    assert result[0].content == "Anh ấy nói với anh à, đi thôi."
 
 
 def test_ai_usage_ledger_records_tokens_and_estimated_cost(tmp_path):

@@ -10,6 +10,7 @@ from pathlib import Path
 import srt
 
 from .artifacts import atomic_write_json
+from .config import get_settings
 from .subtitle import is_ignorable_asr_fragment
 
 
@@ -63,8 +64,13 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
     timing_path = job_dir / "tts-timing.json"
     if timing_path.is_file():
         timing = json.loads(timing_path.read_text(encoding="utf-8"))
+        settings = get_settings()
         rushed = [item["id"] for item in timing if item.get("tempo", 1.0) > 1.12]
         overflow = [item["id"] for item in timing if item.get("overflow_ms", 0) > 150]
+        long_span_ms = max(0, settings.tts_long_utterance_warning_ms)
+        long_span = [item["id"] for item in timing if item.get("source_span_ms", 0) > long_span_ms]
+        max_gap_ms = int(settings.tts_sentence_gap_break_seconds * 1000)
+        large_internal_gap = [item["id"] for item in timing if item.get("max_internal_gap_ms", 0) > max_gap_ms]
         timing_ids = [item_id for item in timing for item_id in item.get("cue_ids", [item.get("id")])]
         misaligned = [
             item.get("id") for item in timing
@@ -73,6 +79,8 @@ def validate_job(job_dir: Path, subtitles: list[srt.Subtitle], expected_ids: lis
         ]
         add("tts_speed", "pass" if not rushed else "warning", "TTS speed is within natural limits" if not rushed else f"Review rushed utterances: {rushed[:20]}")
         add("tts_deadlines", "pass" if not overflow else "warning", "TTS clips fit their windows" if not overflow else f"Audio exceeds windows: {overflow[:20]}")
+        add("tts_source_span", "pass" if not long_span else "warning", "Source phrase durations are consistent" if not long_span else f"Long utterance spans: {long_span[:20]}")
+        add("tts_internal_gap", "pass" if not large_internal_gap else "warning", "Intra-phrase gaps are manageable" if not large_internal_gap else f"Large cue gaps inside same phrase: {large_internal_gap[:20]}")
         add(
             "tts_cue_coverage", "pass" if timing_ids == expected_ids else "error",
             "Every subtitle cue belongs to exactly one punctuated TTS phrase" if timing_ids == expected_ids

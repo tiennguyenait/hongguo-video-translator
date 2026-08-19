@@ -33,7 +33,9 @@ def init_db() -> None:
                 source_language_code TEXT NOT NULL, source_language TEXT NOT NULL,
                 target_language TEXT NOT NULL, glossary TEXT,
                 burn_subtitles INTEGER NOT NULL, dub INTEGER NOT NULL,
-                tts_voice TEXT NOT NULL, original_audio_volume REAL NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                tts_voice TEXT NOT NULL, speaker_gender_profile TEXT NOT NULL DEFAULT 'auto',
+                original_audio_volume REAL NOT NULL,
                 received_bytes INTEGER, sha256 TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             )"""
@@ -59,6 +61,14 @@ def init_db() -> None:
             db.execute("ALTER TABLE jobs ADD COLUMN received_bytes INTEGER")
         if "sha256" not in columns:
             db.execute("ALTER TABLE jobs ADD COLUMN sha256 TEXT")
+        if "speaker_gender_profile" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN speaker_gender_profile TEXT NOT NULL DEFAULT 'auto'")
+        if "translation_draft_provider" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN translation_draft_provider TEXT NOT NULL DEFAULT 'deepseek'")
+        if "translation_refine_provider" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN translation_refine_provider TEXT NOT NULL DEFAULT 'auto'")
+        if "retry_count" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
         db.execute(
             """CREATE TABLE IF NOT EXISTS batches (
                 id TEXT PRIMARY KEY, status TEXT NOT NULL, progress_message TEXT NOT NULL,

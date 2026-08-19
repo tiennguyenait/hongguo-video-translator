@@ -2,6 +2,7 @@ import json
 import re
 import subprocess
 import shutil
+import logging
 from pathlib import Path
 
 import srt
@@ -25,6 +26,7 @@ from .prosody import PROSODY_VERSION, plan_prosody
 # instead of being spoken unnaturally fast.
 MAX_NATURAL_TEMPO = 1.12
 
+logger = logging.getLogger(__name__)
 
 def sentence_aligned_utterances(
     subtitles: list[srt.Subtitle], speakers: dict[int, str],
@@ -40,16 +42,20 @@ def sentence_aligned_utterances(
         return []
     result: list[tuple[srt.Subtitle, str | None, list[int]]] = []
     current: list[srt.Subtitle] = []
+    settings = get_settings()
+    gap_threshold = max(0.0, settings.tts_sentence_gap_break_seconds)
     for cue in subtitles:
         if current:
             previous_complete = bool(re.search(r'[.!?…]["”’)]?\s*$', current[-1].content.strip()))
             previous_speaker = speakers.get(current[-1].index)
             current_speaker = speakers.get(cue.index)
             speaker_changed = bool(previous_speaker and current_speaker and previous_speaker != current_speaker)
+            gap_seconds = (cue.start - current[-1].end).total_seconds()
+            gap_break = gap_seconds > gap_threshold
             # SRT timing gaps and visual line wraps are not linguistic stops.
             # Punctuation ends a spoken phrase; speaker changes are retained as
             # timing boundaries even when the final audio uses one narrator voice.
-            if previous_complete or speaker_changed:
+            if previous_complete or speaker_changed or gap_break:
                 first, last = current[0], current[-1]
                 result.append((
                     srt.Subtitle(first.index, first.start, last.end, " ".join(item.content.strip() for item in current)),
@@ -243,6 +249,7 @@ def create_dub(
 ) -> Path:
     clips_dir = job_dir / "tts"
     clips_dir.mkdir(exist_ok=True)
+    settings = get_settings()
     # Remove legacy full-length PCM timelines from pre-FFmpeg jobs.
     (job_dir / "vi-dub.wav").unlink(missing_ok=True)
     video_duration_ms = int(probe_duration(video) * 1000)
@@ -281,6 +288,24 @@ def create_dub(
     for number, (cue, speaker) in enumerate(utterances, 1):
         plan = plans[number - 1]
         cue_ids = sentence_units[number - 1][2]
+        source_by_id = {item.index: item for item in subtitles}
+        unit_subtitles = [source_by_id[item_id] for item_id in cue_ids if item_id in source_by_id]
+        max_internal_gap_ms = 0
+        for index in range(1, len(unit_subtitles)):
+            gap_ms = int((unit_subtitles[index].start - unit_subtitles[index - 1].end).total_seconds() * 1000)
+            if gap_ms > max_internal_gap_ms:
+                max_internal_gap_ms = gap_ms
+        source_span_ms = int((cue.end - cue.start).total_seconds() * 1000)
+        long_span_ms = max(0, settings.tts_long_utterance_warning_ms)
+        if source_span_ms > long_span_ms:
+            logger.warning(
+                "job=%s sentence=%s long source span=%dms from %s cue ids=%s",
+                job_dir.name, plan.id, source_span_ms, cue.start, cue_ids,
+            )
+            if progress:
+                progress(
+                    f"⚠ sentence {plan.id} spans {source_span_ms}ms (ids={cue_ids}), keep an eye on natural pacing",
+                )
         clip_path = clips_dir / f"{cue.index:06d}.wav"
         audio = AudioSegment.from_file(clip_path)
         raw_original_ms = len(audio)
@@ -309,6 +334,8 @@ def create_dub(
             "source_start_ms": plan.start_ms, "scheduled_start_ms": scheduled_start_ms,
             "schedule_shift_ms": scheduled_start_ms - plan.start_ms,
             "alignment_mode": "punctuated_sentence",
+            "source_span_ms": source_span_ms, "max_internal_gap_ms": max_internal_gap_ms,
+            "num_source_cues": len(cue_ids),
             "cue_ids": cue_ids,
         })
         if progress and (number == len(utterances) or number % 5 == 0):

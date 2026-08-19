@@ -9,19 +9,46 @@ from typing import Any
 import numpy as np
 
 
-PUNCTUATION_PAUSE_MS = {"minor": 180, "medium": 240, "sentence": 360, "question": 320}
+PUNCTUATION_PAUSE_MS = {
+    "minor": 210,
+    "medium": 260,
+    "sentence": 380,
+    "question": 340,
+}
+_PAUSE_BOUNDARIES = ",;:!?。.，、！？…"
 
 
 def split_for_natural_pauses(text: str) -> list[tuple[str, int]]:
     """Split at spoken punctuation and retain an explicit post-clause pause."""
-    parts = re.split(r"(?<=[,;:!?])\s+|(?<=\.)\s+|(?<=…)\s+", text.strip())
+    normalized = re.sub(r"\s+", " ", text.strip())
+    if not normalized:
+        return []
+    # Normalize ASCII ellipsis so we don't emit punctuation-only chunks like '.'
+    # that later get interpreted as standalone long-paused segments by the
+    # inference backend.
+    normalized = re.sub(r"\.{3,}", "…", normalized)
+    # Keep punctuation with preceding text; split even when punctuation is
+    # followed by no whitespace (common with some translation outputs).
+    parts = re.split(rf"(?<=[{_PAUSE_BOUNDARIES}])\s*", normalized)
+    merged: list[str] = []
     result: list[tuple[str, int]] = []
+    punctuation_chunk = r"[.,;:!?。.，、！？…]+"
     for part in (item.strip() for item in parts):
         if not part:
             continue
+        # Consecutive punctuation can generate fragments (for example "..." split
+        # into "." chunks). Merge those fragments back into the previous phrase.
+        if merged and re.fullmatch(punctuation_chunk, part):
+            merged[-1] = f"{merged[-1]}{part}"
+            continue
+        if re.fullmatch(punctuation_chunk, part):
+            # Pure punctuation without prior text is not spoken as an utterance.
+            continue
+        merged.append(part)
+    for part in merged:
         if re.search(r"(?:\.{2,}|…+)$", part):
             pause = PUNCTUATION_PAUSE_MS["sentence"]
-        elif re.search(r"[!?]+$", part):
+        elif re.search(r"[!?！？]+$", part):
             pause = PUNCTUATION_PAUSE_MS["question"]
         elif re.search(r"\.+$", part):
             pause = PUNCTUATION_PAUSE_MS["sentence"]

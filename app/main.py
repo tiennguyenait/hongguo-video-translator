@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from typing import Any
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -14,6 +15,7 @@ from .jobs import apply_subtitle_review, job_directory, remove_job_files, safe_j
 from .models import JobStatus
 from .schemas import BatchDownloadAck, BatchResponse, JobCreate, JobResponse, JobReview
 from .subtitle import read_srt
+from .config import get_settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -63,6 +65,71 @@ def serialize_batch(row: dict) -> dict:
     }
 
 
+def _build_job_request(payload: dict[str, Any]) -> JobCreate:
+    settings = get_settings()
+    payload = dict(payload)
+    payload.setdefault("provider", settings.default_provider)
+    payload.setdefault("translation_draft_provider", settings.default_translation_draft_provider)
+    payload.setdefault("translation_refine_provider", settings.default_provider if settings.default_translation_refine_provider == "auto" else settings.default_translation_refine_provider)
+    payload.setdefault("asr_model", settings.default_asr_model)
+    payload.setdefault("diarize", settings.default_diarize)
+    payload.setdefault("min_speakers", settings.default_min_speakers)
+    payload.setdefault("max_speakers", settings.default_max_speakers)
+    payload.setdefault("source_language_code", settings.default_source_language_code)
+    payload.setdefault("source_language", settings.default_source_language)
+    payload.setdefault("target_language", settings.default_target_language)
+    payload.setdefault("burn_subtitles", settings.default_burn_subtitles)
+    payload.setdefault("hide_source_subtitles", settings.default_hide_source_subtitles)
+    payload.setdefault("dub", settings.default_dub)
+    payload.setdefault("tts_voice", settings.default_tts_voice)
+    payload.setdefault("original_audio_volume", settings.default_original_audio_volume)
+    payload.setdefault("speaker_gender_profile", "auto")
+    return JobCreate(url="https://upload.local/source.mp4", **payload)
+
+
+def _resolve_batch_branding(payload: dict[str, Any], logo: UploadFile | None) -> tuple[str, float, Path | None]:
+    settings = get_settings()
+    channel_name = str(payload.pop("channel_name", "")).strip() or settings.default_channel_name.strip()
+    opacity_raw = payload.pop("watermark_opacity", settings.default_watermark_opacity)
+    try:
+        watermark_opacity = float(opacity_raw)
+    except (TypeError, ValueError):
+        raise ValueError("Watermark opacity must be a number")
+    if not 0.15 <= watermark_opacity <= 0.85:
+        raise ValueError("Watermark opacity must be between 0.15 and 0.85")
+    if len(channel_name) > 80:
+        raise ValueError("Channel name may contain at most 80 characters")
+
+    has_logo_upload = bool(logo and logo.filename)
+    default_logo_raw = settings.default_channel_logo.strip()
+    default_logo = Path(default_logo_raw)
+    if default_logo_raw and not default_logo.is_absolute():
+        default_logo = settings.server_dir / default_logo_raw
+    default_logo = default_logo if default_logo.is_file() else None
+
+    if channel_name:
+        if has_logo_upload:
+            return channel_name, watermark_opacity, None
+        if default_logo is not None:
+            return channel_name, watermark_opacity, default_logo
+        raise ValueError(
+            "Channel branding requires both channel name and channel logo. "
+            "Send both in request (channel_name + logo) or configure "
+            "HONGGUO_DEFAULT_CHANNEL_NAME + HONGGUO_DEFAULT_CHANNEL_LOGO on server."
+        )
+
+    if has_logo_upload and not settings.default_channel_name:
+        raise ValueError(
+            "Channel branding requires both channel name and channel logo. "
+            "Upload the logo with channel_name, or set HONGGUO_DEFAULT_CHANNEL_NAME + "
+            "HONGGUO_DEFAULT_CHANNEL_LOGO on server."
+        )
+
+    if has_logo_upload:
+        return settings.default_channel_name.strip(), watermark_opacity, None
+    return "", watermark_opacity, None
+
+
 @app.get("/", include_in_schema=False)
 def index():
     return FileResponse(STATIC_DIR / "index.html")
@@ -90,6 +157,7 @@ def cloned_voice_demo():
 def create_job(request: JobCreate):
     try:
         batching.require_upload_capacity()
+        request = _build_job_request(request.model_dump())
     except batching.InsufficientStorageError as exc:
         raise HTTPException(507, str(exc)) from exc
     return serialize_job(worker.submit(request))
@@ -103,7 +171,7 @@ def create_upload_job(video: UploadFile = File(...), options: str = Form("{}")):
         if not isinstance(payload, dict):
             raise ValueError("Upload options must be a JSON object")
         payload.pop("url", None)
-        request = JobCreate(url="https://upload.local/source.mp4", **payload)
+        request = _build_job_request(payload)
         return serialize_job(worker.submit_upload(request, video.filename or "video.mp4", video.file))
     except batching.InsufficientStorageError as exc:
         raise HTTPException(507, str(exc)) from exc
@@ -131,21 +199,17 @@ def create_folder_upload(
         if not isinstance(payload, dict):
             raise ValueError("Upload options must be a JSON object")
         payload.pop("url", None)
-        channel_name = str(payload.pop("channel_name", "")).strip()
-        watermark_opacity = float(payload.pop("watermark_opacity", 0.58))
-        if len(channel_name) > 80:
-            raise ValueError("Channel name may contain at most 80 characters")
-        if not 0.15 <= watermark_opacity <= 0.85:
-            raise ValueError("Watermark opacity must be between 0.15 and 0.85")
-        if bool(channel_name) != bool(logo and logo.filename):
-            raise ValueError("Provide both channel name and channel logo, or leave both empty")
-        request = JobCreate(url="https://upload.local/source.mp4", **payload)
+        channel_name, watermark_opacity, default_logo = _resolve_batch_branding(payload, logo)
+        request = _build_job_request(payload)
         ordered = sorted(mp4_videos, key=lambda item: batching.natural_filename_key(item.filename or ""))
         batch = batching.create_folder_batch(
             request.burn_subtitles, request.dub, channel_name, watermark_opacity,
         )
         if logo and logo.filename:
             batching.save_batch_logo(batch["id"], logo.file)
+        elif default_logo is not None:
+            with default_logo.open("rb") as source:
+                batching.save_batch_logo(batch["id"], source)
         for position, video in enumerate(ordered, 1):
             row = worker.submit_upload(
                 request, video.filename or f"episode-{position}.mp4", video.file, enqueue=False,
@@ -222,18 +286,16 @@ def start_chunked_batch(
         if not isinstance(payload, dict):
             raise ValueError("Upload options must be a JSON object")
         payload.pop("url", None)
-        channel_name = str(payload.pop("channel_name", "")).strip()
-        opacity = float(payload.pop("watermark_opacity", 0.58))
-        if len(channel_name) > 80 or not 0.15 <= opacity <= 0.85:
-            raise ValueError("Invalid channel name or watermark opacity")
-        if bool(channel_name) != bool(logo and logo.filename):
-            raise ValueError("Provide both channel name and channel logo, or leave both empty")
-        request = JobCreate(url="https://upload.local/source.mp4", **payload)
+        channel_name, opacity, default_logo = _resolve_batch_branding(payload, logo)
+        request = _build_job_request(payload)
         batch = batching.create_folder_batch(
             request.burn_subtitles, request.dub, channel_name, opacity, expected_episodes,
         )
         if logo and logo.filename:
             batching.save_batch_logo(batch["id"], logo.file)
+        elif default_logo is not None:
+            with default_logo.open("rb") as source:
+                batching.save_batch_logo(batch["id"], source)
         return serialize_batch(get_batch(batch["id"]))
     except batching.InsufficientStorageError as exc:
         raise HTTPException(507, str(exc)) from exc

@@ -62,36 +62,68 @@ def _record_usage(provider: str, model: str, usage: dict | None) -> None:
         )
     atomic_write_json(path, report)
 
-SYSTEM_PROMPT = """You are a senior Vietnamese subtitle localizer for Chinese romance short dramas.
-Translate dialogue into natural Vietnamese for a Vietnamese audience watching a Chinese romance drama.
-Rules:
+SYSTEM_PROMPT = """You are a senior Vietnamese subtitle and dubbing localizer specializing in Chinese romance short dramas.
+
+Your task is to convert Chinese dialogue into natural, emotionally accurate Vietnamese for Vietnamese viewers.
+
+CORE PRINCIPLES
+- Localize meaning and character intent, not Chinese wording.
+- Use natural spoken Vietnamese that sounds like dialogue written by a Vietnamese screenwriter.
+- Preserve the original plot, facts, relationships, emotions, and implied meaning.
+- Do not add new facts, motivations, jokes, exposition, or explanations.
+- Preserve emotional nuances such as longing, jealousy, anger, humiliation, betrayal, reconciliation, family pressure, class/status tension, and romantic tension.
+- Avoid literal Chinese syntax, stiff wording, literary language, and machine-translation style.
+
+ADDRESS & RELATIONSHIPS
+- Use the provided speaker identity for each cue to keep pronoun consistency.
+- Do not assume one speaker dominates a whole batch.
+- Never infer identity, gender, social role, age, or intimacy from technical labels alone.
+- Use scene context and speaker relationship to choose natural Vietnamese address terms.
+- If speaker label is missing/empty, do not force gendered pronouns from 我/你.
+- For ambiguous cases with no reliable speaker context, prefer neutral forms (ví dụ: em, tôi, người ấy, bạn) rather than guessing.
+
+SPEAKER / PRONOUN RULES
+- Speaker labels identify who is speaking.
+- Do not assume the same speaker continues across adjacent subtitle IDs.
+- Determine the addressee from dialogue context.
+- Determine Vietnamese pronouns from BOTH speaker and addressee context.
+- Never infer pronouns from Chinese 我/你 alone.
+- Maintain consistent pronouns between the same two interacting speakers.
+
+ASR REPAIR
+- Input may come from ASR and may contain recognition errors, duplicated words, missing words, or meaningless fragments.
+- Use neighboring dialogue and scene context to repair obvious ASR errors.
+- Preserve the most likely intended meaning.
+- Never invent new plot information.
+- Remove isolated ASR garbage when it clearly cannot belong to the dialogue.
+- Do not reproduce accidental ASR duplication.
+- Preserve meaningful repetition when it expresses hesitation, panic, anger, emphasis, or emotion.
+
+SUBTITLE & DUBBING
+- Keep each line concise, readable, and natural.
+- Prefer shorter natural wording when the meaning remains complete.
+- Respect max_words when provided.
+- Ensure the line is comfortably speakable within target_duration_seconds when provided.
+- For dubbing, prioritize natural speaking rhythm and duration over literal completeness.
+- Punctuate by meaning so TTS produces natural pauses.
+- Every line should keep natural Vietnamese sentence-level punctuation at the end
+  (., ?, !, ...). Match question and exclamation tone from source cues where
+  possible (for example, source ends with ?/？ should map to ?, !/！ to !).
+- Use commas only when the cue is clearly a continuation of the same sentence;
+  otherwise prefer . or ?/! for final cadence.
+- Do not add ellipses merely because a sentence is split across subtitle cues.
+- When one Chinese phrase spans multiple IDs, distribute the Vietnamese naturally across those IDs without repeating words.
+
+OUTPUT
 - Return valid JSON only.
 - Preserve every id exactly.
 - Preserve the exact number of items.
-- Translate only the text.
+- Translate only the text field.
 - Do not include timestamps.
-- Do not add explanations.
-- Keep names, brands, numbers, and repeated words.
-- Treat this as romance-drama localization, not generic translation: preserve longing, jealousy, family pressure, class/status tension, betrayal, reconciliation, and overbearing-CEO/wealthy-family dynamics when present.
-- Keep the original plot and character intent authoritative. Do not add new facts, motivations, jokes, exposition, or explanations that are not implied by the source.
-- Use Vietnamese address/pronoun choices that fit the relationship and emotional distance: anh/em, tôi/cô, tôi/anh, con/mẹ, cháu/bác, thiếu gia, phu nhân, tổng tài, chủ tịch, trưởng bối, as context requires.
-- DeepSeek reminder: be concise, cinematic, and emotionally natural; avoid literal Chinese syntax even when the Chinese wording is compact.
-- Use natural spoken Vietnamese, not word-for-word translation.
-- Localize meaning and intent; freely restructure Chinese phrasing so it sounds like dialogue written by a Vietnamese screenwriter.
-- Input comes from ASR and may contain corrupted or implausible fragments. Use neighboring items and the scene context to repair obvious recognition errors instead of translating nonsense literally.
-- When repairing ASR noise, preserve the most likely intended meaning and do not invent new plot facts.
-- Omit isolated ASR garbage that cannot fit the surrounding context, especially noise before a clear introduction; never reproduce nonsensical fragments in Vietnamese.
-- Match the requested max_words for each item. Prefer a shorter natural equivalent over a complete literal rendering.
-- The Vietnamese line must be comfortably speakable within target_duration_seconds without rushing.
-- Punctuate Vietnamese by meaning so TTS pauses naturally. Use commas only for short internal pauses and periods/questions/exclamations for complete thoughts.
-- Do not add ellipses merely because a sentence crosses cue boundaries; make the full sequence read continuously and naturally.
-- ASR may split one phrase across adjacent ids. Distribute the Vietnamese phrase across those ids as natural continuations; never repeat the final word in a short fragment id.
-- Keep emotional tension and relationship nuance.
-- Infer pronouns from the Chinese dialogue, forms of address, relationship and scene context.
-- Do not infer identity, gender or social role from technical labels such as SPEAKER_00.
-- Keep subtitles concise and easy to read.
-- Avoid overly literary, stiff, or machine-like Vietnamese.
-- If a sentence is already Vietnamese, lightly polish only if needed."""
+- Do not include explanations or comments.
+- Keep names, brands, and numbers unless localization explicitly requires otherwise.
+- If the source is already Vietnamese, lightly polish it only when necessary."""
+
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 SHORTEN_SYSTEM_PROMPT = """You are a Vietnamese dialogue editor.
 Rewrite each Vietnamese line into natural, conversational short-drama dialogue.
@@ -115,9 +147,141 @@ Rules:
 - Preserve plot facts, names, numbers, intent and emotional progression.
 - Make adjacent lines flow naturally; remove accidental repetition caused by ASR.
 - Keep character address and pronouns consistent with speaker and context.
+- Speaker labels identify who is speaking in each cue.
+- Do not assume the same speaker continues across adjacent ids.
+- If a cue has no speaker label, do not infer gender or social role from 我/你.
+- Avoid introducing gendered pronouns unless supported by clear speaker context.
 - Prefer idiomatic spoken Vietnamese over literal Chinese syntax, especially for romance-drama conflict, status, jealousy, longing, and family-pressure scenes.
 - When one source sentence crosses adjacent ids, distribute it as a continuous Vietnamese sentence. Never turn a one-character ASR tail into a repeated standalone word.
-- Do not exceed each item's max_words. Do not add explanations."""
+- Do not exceed each item's max_words. Do not add explanations.
+- Ensure each edited line has natural sentence-ending punctuation for TTS pauses
+  (., ?, !, ...). If the cue is rhetorical or clearly interrogative, use ?.
+"""
+
+PUNCTUATION_SYSTEM_PROMPT = """You are a Vietnamese subtitle punctuation corrector for dubbing.
+Return valid JSON only.
+
+Task: add or adjust only final sentence punctuation for each cue while preserving
+all original words as much as possible.
+
+Rules:
+- Keep exactly the same ids and item count.
+- Keep the Vietnamese wording unchanged except where punctuation is needed
+  for natural cadence.
+- Prefer natural end punctuation from source tone:
+  source ?/？ -> ?, source !/！ -> !, source .../…… -> ....
+- Use a period for neutral declaratives when no explicit strong clue exists.
+- Return JSON in this exact shape: {"translations":[{"id":1,"text":"Vietnamese dialogue"}]}.
+"""
+
+_TRAILING_PUNCT_RE = re.compile(r"[.!?…,:;]\s*[\"”'')\]\}]*$")
+_CJK_QUESTION_PARTICLES = ("吗", "吗?", "吗？", "呢", "吧", "嘛", "么")
+_SOURCE_PUNCT_MAP = {
+    "?": "?",
+    "？": "?",
+    "!": "!",
+    "！": "!",
+    "。": ".",
+    ".": ".",
+    "，": ",",
+    "、": ",",
+    ",": ",",
+    "…": "...",
+    "……": "...",
+}
+
+
+def _has_terminal_punctuation(text: str) -> bool:
+    return bool(_TRAILING_PUNCT_RE.search((text or "").strip()))
+
+
+def _source_tail_punctuation(source_text: str) -> str:
+    cleaned = (source_text or "").strip()
+    if not cleaned:
+        return ""
+    tail = cleaned[-1]
+    if tail in _SOURCE_PUNCT_MAP:
+        return _SOURCE_PUNCT_MAP[tail]
+    if cleaned.endswith("..."):
+        return "..."
+    if cleaned.endswith("……"):
+        return "..."
+    for particle in _CJK_QUESTION_PARTICLES:
+        if cleaned.endswith(particle):
+            return "?"
+    return ""
+
+
+def _append_ending_punctuation(text: str, source: str, fallback: str = ".") -> str:
+    stripped = (text or "").strip()
+    if not stripped:
+        return stripped
+    if _has_terminal_punctuation(stripped):
+        return stripped
+    source_punct = _source_tail_punctuation(source)
+    if source_punct == "," and len(stripped.split()) <= 3:
+        return stripped + ","
+    if source_punct == "," and len(stripped) <= 6 and not stripped.endswith(("à", "ơi", "nha", "nhé", "à.")):
+        return stripped + ","
+    if source_punct:
+        return stripped + source_punct
+    return stripped + fallback
+
+
+def _enforce_punctuation(mapping: dict[int, str], batch: list[dict], provider: str) -> dict[int, str]:
+    source_by_id = {item["id"]: item.get("text", "") for item in batch}
+    items = [
+        {"id": item["id"], "source": item["text"], "draft": mapping[item["id"]], "speaker": item.get("speaker"), "target_duration_seconds": item.get("target_duration_seconds", 0)}
+        for item in batch
+        if mapping.get(item["id"], "").strip()
+    ]
+    needed = [item["id"] for item in items if not _has_terminal_punctuation(mapping[item["id"]])]
+    if not needed:
+        return mapping
+    try:
+        payload = _call_json_provider(
+            provider,
+            PUNCTUATION_SYSTEM_PROMPT,
+            "Add punctuation to these Vietnamese lines while preserving text. Input JSON:\n" + json.dumps(items, ensure_ascii=False),
+            needed,
+        )
+        for item_id, text in payload.items():
+            if item_id in needed and text.strip():
+                mapping[item_id] = text.strip()
+    except Exception:
+        pass
+    for item_id in needed:
+        text = mapping.get(item_id, "")
+        if not _has_terminal_punctuation(text):
+            mapping[item_id] = _append_ending_punctuation(text, source_by_id.get(item_id, ""), ".")
+    return mapping
+
+
+def _polish_prompt(
+    items: list[dict], source: str, target: str, glossary: str | None, context_note: str = "",
+) -> str:
+    return (
+        f"Source language: {source}\nTarget language: {target}\n"
+        "Task: polish rough Vietnamese draft subtitles for emotional accuracy and natural spoken tone.\n"
+        "Rules:\n"
+        "- Keep exactly the same ids and count.\n"
+        "- Output only Vietnamese dialogue text in the `text` field.\n"
+        "- Do not change meaning, facts, plot events, names, or character relationships.\n"
+        "- Improve pronoun/address choices using speaker context and scene emotion.\n"
+        "- Keep lines concise and fit cue duration.\n"
+        "Input format per item:\n"
+        "- id: numeric subtitle id\n"
+        "- source: original Chinese line\n"
+        "- draft: rough Vietnamese translation from the first pass\n"
+        f"Glossary:\n{glossary or '(none)'}\n\n"
+        + json.dumps(items, ensure_ascii=False)
+        + ("\n\nContext note:\n" + context_note if context_note else "")
+    )
+
+
+def _call_json_provider(provider: str, system_prompt: str, user_prompt: str, expected_ids: list[int]) -> dict[int, str]:
+    raw = _gemini(system_prompt, user_prompt) if provider == "gemini" else _openai_compatible(provider, system_prompt, user_prompt)
+    return parse_translation_json(raw, expected_ids, allow_missing=True)
 
 
 def _required(name: str) -> str:
@@ -127,13 +291,14 @@ def _required(name: str) -> str:
     return value
 
 
-def _user_prompt(items: list[dict], source: str, target: str, glossary: str | None) -> str:
+def _user_prompt(items: list[dict], source: str, target: str, glossary: str | None, context_note: str = "") -> str:
     return (
         f"Source language: {source}\nTarget language: {target}\n"
         "Style: Vietnamese Chinese-romance short-drama subtitles, faithful to original timing and plot.\n"
         f"Glossary:\n{glossary or '(none)'}\n\n"
-        "Translate this JSON array and return the same ids:\n"
+        "Translate this JSON array and return the same ids, preserving natural Vietnamese punctuation for each line.\n"
         + json.dumps(items, ensure_ascii=False)
+        + ("\n\nContext note:\n" + context_note if context_note else "")
     )
 
 
@@ -188,8 +353,19 @@ def translate_subtitles(
     subtitles: list[srt.Subtitle], provider: str, source_language: str, target_language: str,
     glossary: str | None = None, progress: Callable[[str], None] | None = None,
     speakers: dict[int, str] | None = None, job_dir: Path | None = None,
+    speaker_gender_profile: str | None = None, draft_provider: str | None = None,
+    refine_provider: str | None = None,
 ) -> list[srt.Subtitle]:
     settings = get_settings()
+    refine_provider = (refine_provider or provider).lower().strip()
+    draft_provider = (draft_provider or provider).lower().strip()
+    if draft_provider == "google":
+        draft_provider = refine_provider
+    if refine_provider not in {"openai", "gemini", "deepseek"}:
+        raise ValueError(f"Unsupported refine provider: {refine_provider}")
+    if draft_provider not in {"openai", "gemini", "deepseek"}:
+        raise ValueError(f"Unsupported draft provider: {draft_provider}")
+    primary_provider = refine_provider
     # Preserve speaker consistency without exposing diarizer labels such as
     # SPEAKER_07 to the LLM (those labels carry no identity or gender).
     speaker_aliases = {
@@ -199,6 +375,40 @@ def translate_subtitles(
     translated: list[srt.Subtitle] = []
     draft_path = job_dir / "vi-draft.json" if job_dir else None
     draft_mapping: dict[int, str] = {}
+    speaker_labels = [label for label in dict.fromkeys((speakers or {}).values()) if label]
+    reliable_speaker_count = len(set(speaker_labels))
+    has_any_speaker = reliable_speaker_count >= 2
+
+def _speaker_note() -> str:
+    profile = (speaker_gender_profile or "auto").lower()
+    if has_any_speaker:
+        note = (
+            "Speaker labels are anonymous aliases only (character_1 / character_2). "
+            "Do not infer gender, social status, or relationship from the label alone. "
+            "If the cue does not explicitly indicate a clear honorific relationship, avoid Anh/Em and prefer neutral forms "
+            "(bạn, mình, người ấy) to reduce wrong gendered address."
+        )
+    else:
+        note = (
+            "No reliable speaker IDs were available for this batch. "
+            "Do not infer gender or social role from 我/你 alone. "
+            "Prefer neutral Vietnamese address forms (bạn, mình, em, tôi, người ấy) and keep consistency where possible."
+        )
+    if profile == "female":
+        note += (
+            " The request was explicitly marked as female-narrator style; if a direct 2nd-person line must exist, "
+            "use polite female-first forms like em."
+        )
+    elif profile == "male":
+        note += (
+            " The request was explicitly marked as male-narrator style; if a direct 2nd-person line must exist, "
+            "use polite male-first forms like anh."
+        )
+    elif profile == "neutral":
+        note += (
+            " Use neutral address forms by default; avoid shifting to Anh/Em unless explicitly anchored by context."
+        )
+    return note
     if draft_path and draft_path.is_file():
         try:
             draft_mapping = {int(item["id"]): str(item["text"]) for item in json.loads(draft_path.read_text(encoding="utf-8"))}
@@ -213,7 +423,7 @@ def translate_subtitles(
                 # Speaker labels are contextual metadata, never translation
                 # text.  Including them fixes pronoun/address drift while
                 # keeping the strict JSON output contract unchanged.
-                "character": speaker_aliases.get((speakers or {}).get(cue.index)),
+                "speaker": speaker_aliases.get((speakers or {}).get(cue.index)) if has_any_speaker else None,
                 "target_duration_seconds": round((cue.end - cue.start).total_seconds(), 2),
                 # Keep the budget conservative so dubbing stays close to the
                 # original cue instead of relying on aggressive time-stretch.
@@ -228,6 +438,7 @@ def translate_subtitles(
             and all(draft_mapping[item_id].strip() for item_id in required_ids)
         ):
             mapping = {cue.index: draft_mapping[cue.index] for cue in batch}
+            mapping = _enforce_punctuation(mapping, items, primary_provider)
             translated.extend(srt.Subtitle(index=cue.index, start=cue.start, end=cue.end, content=mapping[cue.index]) for cue in batch)
             if progress:
                 progress(f"Resumed translation {min(offset + len(batch), len(subtitles))}/{len(subtitles)} cues")
@@ -236,17 +447,18 @@ def translate_subtitles(
         context_end = min(len(subtitles), offset + len(batch) + settings.translation_context_after)
         context = [
             {"id": cue.index, "text": cue.content,
-             "character": speaker_aliases.get((speakers or {}).get(cue.index)), "translate": cue in batch}
+             "speaker": speaker_aliases.get((speakers or {}).get(cue.index)) if has_any_speaker else None,
+             "translate": cue in batch}
             for cue in subtitles[context_start:context_end]
         ]
-        prompt = _user_prompt(items, source_language, target_language, glossary)
+        speaker_note = _speaker_note()
+        prompt = _user_prompt(items, source_language, target_language, glossary, speaker_note)
         prompt += "\n\nContext before/after (for understanding only; translate=false ids must not be returned):\n"
         prompt += json.dumps(context, ensure_ascii=False)
         last_error: Exception | None = None
         for attempt in range(1, settings.translation_retries + 1):
             try:
-                raw = _gemini(SYSTEM_PROMPT, prompt) if provider == "gemini" else _openai_compatible(provider, SYSTEM_PROMPT, prompt)
-                mapping = parse_translation_json(raw, expected_ids, allow_missing=True)
+                mapping = _call_json_provider(primary_provider, SYSTEM_PROMPT, prompt, expected_ids)
                 # A present-but-empty translation is equivalent to an omitted
                 # item for real dialogue. Only tightly bounded ASR noise may be
                 # intentionally silent.
@@ -264,12 +476,8 @@ def translate_subtitles(
                         f"The required ids are {missing_ids}:\n"
                         + json.dumps(missing_items, ensure_ascii=False)
                     )
-                    repair_raw = (
-                        _gemini(SYSTEM_PROMPT, repair_prompt)
-                        if provider == "gemini"
-                        else _openai_compatible(provider, SYSTEM_PROMPT, repair_prompt)
-                    )
-                    mapping.update(parse_translation_json(repair_raw, missing_ids))
+                    repair_raw = _call_json_provider(primary_provider, SYSTEM_PROMPT, repair_prompt, missing_ids)
+                    mapping.update(repair_raw)
                     still_empty = [item_id for item_id in missing_ids if not mapping[item_id].strip()]
                     if still_empty:
                         raise ValueError(f"Provider returned empty dialogue for ids: {still_empty}")
@@ -298,12 +506,7 @@ def translate_subtitles(
                         "INPUT:\n" + json.dumps(shorten_items, ensure_ascii=False)
                     )
                     try:
-                        shortened_raw = (
-                            _gemini(SHORTEN_SYSTEM_PROMPT, shorten_prompt)
-                            if provider == "gemini"
-                            else _openai_compatible(provider, SHORTEN_SYSTEM_PROMPT, shorten_prompt)
-                        )
-                        shortened = parse_translation_json(shortened_raw, overlong)
+                        shortened = _call_json_provider(primary_provider, SHORTEN_SYSTEM_PROMPT, shorten_prompt, overlong)
                         empty_shortened = [item_id for item_id, text in shortened.items() if not text.strip()]
                         if empty_shortened:
                             raise ValueError(f"Provider returned empty shortened dialogue for ids: {empty_shortened}")
@@ -333,6 +536,7 @@ def translate_subtitles(
                         )
                 for cue in batch:
                     mapping.setdefault(cue.index, "")
+                mapping = _enforce_punctuation(mapping, items, primary_provider)
                 break
             except Exception as exc:
                 last_error = exc
@@ -356,6 +560,16 @@ def translate_subtitles(
         if progress:
             progress(f"Translated {min(offset + len(batch), len(subtitles))}/{len(subtitles)} subtitle cues")
     if not settings.translation_scene_review or len(translated) < 2:
+        if target_language.lower().startswith("vietnam"):
+            source_by_id = {cue.index: cue.content for cue in subtitles}
+            translated = [
+                srt.Subtitle(
+                    index=cue.index, start=cue.start, end=cue.end,
+                    content=_append_ending_punctuation(cue.content, source_by_id.get(cue.index, ""))
+                )
+                if not is_ignorable_asr_fragment(cue) else cue
+                for cue in translated
+            ]
         if job_dir:
             atomic_write_json(job_dir / "vi-final.json", [{"id": cue.index, "text": cue.content} for cue in translated])
         return translated
@@ -369,12 +583,16 @@ def translate_subtitles(
         review_items = [
             {
                 "id": cue.index, "text": cue.content,
+                "speaker": speaker_aliases.get((speakers or {}).get(cue.index)) if has_any_speaker else None,
                 "max_words": max(2, min(24, round((cue.end - cue.start).total_seconds() * 3.2))),
             }
             for cue in scene
         ]
         previous = translated[max(0, offset - 5):offset]
         user = "Edit this scene:\n" + json.dumps(review_items, ensure_ascii=False)
+        scene_note = _speaker_note()
+        if scene_note:
+            user += "\n\nContext note:\n" + scene_note
         if previous:
             user += "\nPrevious dialogue for context only:\n" + json.dumps(
                 [{"id": cue.index, "text": final_mapping[cue.index]} for cue in previous], ensure_ascii=False
@@ -382,7 +600,7 @@ def translate_subtitles(
         last_error: Exception | None = None
         for attempt in range(1, settings.translation_retries + 1):
             try:
-                raw = _gemini(SCENE_EDITOR_PROMPT, user) if provider == "gemini" else _openai_compatible(provider, SCENE_EDITOR_PROMPT, user)
+                raw = _gemini(SCENE_EDITOR_PROMPT, user) if primary_provider == "gemini" else _openai_compatible(primary_provider, SCENE_EDITOR_PROMPT, user)
                 reviewed = parse_translation_json(raw, [cue.index for cue in scene])
                 empty_reviewed = [
                     cue.index for cue in scene
@@ -394,6 +612,14 @@ def translate_subtitles(
                 too_long = [item_id for item_id, text in reviewed.items() if len(text.split()) > limits[item_id] + 2]
                 if too_long:
                     raise ValueError(f"Scene editor exceeded word budget for ids: {too_long}")
+                scene_items = [
+                    {"id": cue.index, "text": source_text, "speaker": scene_alias}
+                    for cue, source_text, scene_alias in [
+                        (cue, cue.content, speaker_aliases.get((speakers or {}).get(cue.index)) if has_any_speaker else None)
+                        for cue in translated[offset : offset + review_size]
+                    ]
+                ]
+                reviewed = _enforce_punctuation(reviewed, scene_items, primary_provider)
                 final_mapping.update(reviewed)
                 break
             except Exception as exc:

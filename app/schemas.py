@@ -7,10 +7,12 @@ from pydantic import BaseModel, Field, field_validator
 
 class JobCreate(BaseModel):
     url: str
-    provider: Literal["openai", "gemini", "deepseek"] = "openai"
-    # large-v3 is materially more reliable for Chinese drama dialogue than the
-    # small Qwen local default; Qwen remains available as an explicit option.
-    asr_model: Literal["tiny", "base", "small", "medium", "large-v3", "qwen3-asr-1.7b"] = "large-v3"
+    provider: Literal["openai", "gemini", "deepseek"] = "deepseek"
+    translation_draft_provider: Literal["openai", "gemini", "deepseek"] = "deepseek"
+    translation_refine_provider: Literal["auto", "openai", "gemini", "deepseek"] = "auto"
+    # Qwen3-ASR is the quality-first default for Chinese short-drama dialogue.
+    # WhisperX large-v3 remains available as a fallback/compatibility option.
+    asr_model: Literal["tiny", "base", "small", "medium", "large-v3", "qwen3-asr-1.7b"] = "qwen3-asr-1.7b"
     diarize: bool = True
     min_speakers: int | None = Field(default=None, ge=1, le=20)
     max_speakers: int | None = Field(default=6, ge=1, le=20)
@@ -23,6 +25,7 @@ class JobCreate(BaseModel):
     dub: bool = True
     tts_voice: str = Field(default="Ngọc Huyền — authorized clone", max_length=100)
     original_audio_volume: float = Field(default=0.08, ge=0.0, le=1.0)
+    speaker_gender_profile: Literal["auto", "female", "male", "neutral"] = "auto"
 
     @field_validator("url")
     @classmethod
@@ -53,13 +56,17 @@ class JobResponse(BaseModel):
     progress_message: str
     error: str | None
     provider: str
+    translation_draft_provider: str
+    translation_refine_provider: str
     asr_model: str
     received_bytes: int | None = None
     sha256: str | None = None
+    retry_count: int = 0
     diarize: bool
     burn_subtitles: bool
     hide_source_subtitles: bool
     dub: bool
+    speaker_gender_profile: str
     created_at: datetime
     updated_at: datetime
     outputs: JobOutputs

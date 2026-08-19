@@ -38,8 +38,8 @@ curl -X POST http://127.0.0.1:8000/api/jobs \
   -H 'Content-Type: application/json' \
   -d '{
     "url":"https://example.com/video.mp4",
-    "provider":"openai",
-    "asr_model":"large-v3",
+    "provider":"deepseek",
+    "asr_model":"qwen3-asr-1.7b",
     "diarize":true,
     "max_speakers":6,
     "source_language_code":"zh",
@@ -57,7 +57,14 @@ Upload MP4 trực tiếp (tối đa 5 GiB):
 ```bash
 curl -X POST http://127.0.0.1:8000/api/jobs/upload \
   -F 'video=@/path/to/video.mp4;type=video/mp4' \
-  -F 'options={"provider":"deepseek","asr_model":"large-v3","diarize":true,"burn_subtitles":true,"dub":true}'
+  -F 'options={"provider":"deepseek","asr_model":"qwen3-asr-1.7b","diarize":true,"burn_subtitles":true,"dub":true}'
+```
+
+Có thể bỏ `options` hoàn toàn (`-F options={}`) thì server dùng mặc định trong `.env`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/jobs/upload \
+  -F 'video=@/path/to/video.mp4;type=video/mp4'
 ```
 
 Upload cả folder, tự sắp theo số tập, xử lý tuần tự, ghép và gắn thương hiệu một lần ở video cuối:
@@ -67,10 +74,18 @@ curl -X POST http://127.0.0.1:8000/api/batches/upload \
   -F 'videos=@/path/tap-2.mp4;type=video/mp4' \
   -F 'videos=@/path/tap-10.mp4;type=video/mp4' \
   -F 'logo=@/path/logo.png;type=image/png' \
-  -F 'options={"provider":"deepseek","asr_model":"large-v3","burn_subtitles":true,"dub":false,"channel_name":"KÊNH REVIEW PHIM","watermark_opacity":0.58}'
+  -F 'options={"channel_name":"KÊNH REVIEW PHIM","watermark_opacity":0.58}'
 ```
 
-Tên file được natural-sort (`tap-2` đứng trước `tap-10`), tối đa 200 MP4. Logo tối đa 5 MiB; nên dùng PNG vuông có nền trong suốt. Logo và chữ nằm ở góc trên trái, cùng opacity mặc định `0.58`. Phải gửi cả `channel_name` và `logo`, hoặc bỏ trống cả hai.
+Tên file được natural-sort (`tap-2` đứng trước `tap-10`), tối đa 200 MP4. Logo tối đa 5 MiB; nên dùng PNG vuông có nền trong suốt. Logo và chữ nằm ở góc trên trái, cùng opacity mặc định `0.58`.
+
+`channel_name` dùng để branding watermark khi batch. Server sẽ:
+
+1. Ưu tiên `channel_name` + `logo` trong request.
+2. Nếu request không gửi cả hai, tự lấy mặc định từ `HONGGUO_DEFAULT_CHANNEL_NAME` + `HONGGUO_DEFAULT_CHANNEL_LOGO`.
+3. Nếu cả 2 đều trống, batch sẽ không watermark.
+
+`logo` chỉ cần gửi khi muốn override branding mặc định; không bắt buộc nếu đã cấu hình mặc định server.
 
 UI upload folder theo các request 15 tập. Nhóm đã nhận được giữ nguyên nếu nhóm sau mất mạng; mỗi nhóm tự retry tối đa ba lần. Job của nhóm đầu có thể xử lý trong lúc trình duyệt tiếp tục upload nhóm sau. Ba endpoint phục vụ luồng resumable này là `POST /api/batches/start`, `POST /api/batches/{id}/chunks` và `POST /api/batches/{id}/finish`.
 
